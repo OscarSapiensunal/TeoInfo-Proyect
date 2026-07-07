@@ -1,0 +1,79 @@
+<!-- android/app/src/main/AndroidManifest.xml
+     Permisos requeridos para Bluetooth Clásico (RFCOMM/SPP) y audio.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.dsp_bt_analyzer">
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PERMISOS BLUETOOTH
+         Android 12+ (API 31+): BLUETOOTH_SCAN + BLUETOOTH_CONNECT
+         Android ≤ 11 (API ≤ 30): BLUETOOTH + BLUETOOTH_ADMIN + LOCATION
+    ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- API ≤ 30: Bluetooth clásico básico -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- API 31+: Nuevos permisos granulares -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+    <!-- Necesario para descubrimiento en API ≤ 30 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PERMISOS DE AUDIO Y ALMACENAMIENTO
+    ═══════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- Mantener CPU activa durante transmisión/recepción -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- Feature declarations -->
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="true" />
+
+    <application
+        android:label="DSP BT Analyzer"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/LaunchTheme"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Servicio en primer plano para transmisión BT continua -->
+        <service
+            android:name=".BtTransmissionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+    </application>
+</manifest>

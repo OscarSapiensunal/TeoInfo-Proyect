@@ -1,0 +1,51 @@
+name: dsp_bt_analyzer
+description: >
+  Simulador y analizador de transmisión de señales de audio digital
+  en canal ruidoso via Bluetooth Clásico (RFCOMM/SPP).
+  Asignatura: Teoría de la Información y Sistemas de Comunicación.
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ─────────────────────────────────────────────────────────────────
+  # BLUETOOTH CLÁSICO — Sockets RFCOMM/SPP (NO BLE)
+  # ─────────────────────────────────────────────────────────────────
+  flutter_bluetooth_serial: ^0.4.0
+
+  # ─────────────────────────────────────────────────────────────────
+  # AUDIO — Soporte para streams de audio crudo PCM en tiempo real
+  # FoodSink/writeChunk permiten escritura directa de bytes PCM
+  # ─────────────────────────────────────────────────────────────────
+  flutter_sound: ^9.2.13
+
+  # ─────────────────────────────────────────────────────────────────
+  # SELECCIÓN DE ARCHIVOS .wav
+  # ─────────────────────────────────────────────────────────────────
+  file_picker: ^8.0.0
+
+  # ─────────────────────────────────────────────────────────────────
+  # GRÁFICAS EN TIEMPO REAL — RSSI vs Packet Loss
+  # ─────────────────────────────────────────────────────────────────
+  fl_chart: ^0.68.0
+
+  # ─────────────────────────────────────────────────────────────────
+  # UTILIDADES
+  # ─────────────────────────────────────────────────────────────────
+  permission_handler: ^11.3.0   # Permisos BT + Audio en Android/iOS
+  provider: ^6.1.1              # Gestión de estado reactivo
+  path_provider: ^2.1.3         # Rutas de sistema de archivos
+  logger: ^2.3.0                # Logging estructurado
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
