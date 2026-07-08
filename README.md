@@ -8,13 +8,16 @@ detección de pérdidas, aplican DSP y reproducen lo que reciben, con medición
 de latencia por ráfaga. Modo alternativo unidireccional: transmisión de un
 archivo `.wav` de prueba controlada (solo el anfitrión transmite).
 
-**Arquitectura P2P:** el Anfitrión levanta un servidor SPP nativo
-(`MainActivity.kt` — `flutter_bluetooth_serial` solo soporta modo cliente)
-y queda esperando; el Participante escanea, se empareja y conecta como
-cliente. El socket RFCOMM es full-duplex (como un socket TCP): ambos lados
-ejecutan el MISMO pipeline de envío/recepción por el mismo canal, así que
-cualquiera con el micrófono habilitado habla y cualquiera escucha lo que
-llega — de ahí la conversación de dos vías.
+**Sin roles que elegir:** la app no pregunta "quién habla y quién escucha"
+— eso ya no tiene sentido porque ambos hacen ambas cosas. Solo hay que
+decidir CÓMO se establece el enlace: un teléfono toca "Esperar conexión"
+(queda visible, escuchando) y el otro toca "Buscar dispositivo" y lo
+selecciona de la lista. Internamente, quien espera levanta un servidor SPP
+nativo (`MainActivity.kt` — `flutter_bluetooth_serial` solo soporta modo
+cliente) y el otro conecta como cliente, pero el socket RFCOMM resultante
+es full-duplex (como un socket TCP): ambos lados ejecutan el MISMO pipeline
+de envío/recepción por el mismo canal. El micrófono de cada teléfono se
+puede silenciar/activar en cualquier momento, antes o durante la llamada.
 
 **Limitación conocida:** sin cancelación de eco acústico (AEC), si ambos
 micrófono y parlante están activos en el mismo teléfono sin auriculares,
@@ -39,7 +42,7 @@ lib/
 ├── dsp/
 │   └── dsp_processor.dart             # Jitter Buffer (drenado externo), PLC, AWGN, filtros IIR+FIR
 ├── ui/
-│   └── ui_dashboard.dart              # Dashboard: roles, modo de sesión, mic, métricas, gráfica
+│   └── ui_dashboard.dart              # Dashboard: conectar (esperar/buscar), mic, métricas, gráfica
 └── utils/
     └── app_state.dart                 # ChangeNotifier — estado global + permisos + escaneo
 
@@ -184,23 +187,25 @@ En tiempo de ejecución, `AppState.requestAllPermissions()` solicita:
 ## Experimento de laboratorio
 
 **Procedimiento (conversación bidireccional, mismo APK en ambos teléfonos):**
-1. Teléfono A: rol *Anfitrión* → modo *Conversación* → **Activar BT** →
-   **Visible** → **Iniciar sesión** (queda esperando conexión).
-2. Teléfono B: rol *Participante* → **Activar BT** → **Escanear** →
-   tocar al anfitrión en la lista (se empareja si hace falta) → **Iniciar sesión**.
-3. Con el toggle "Mi micrófono" activo en ambos (por defecto lo está), cualquiera
-   de los dos puede hablar y el otro lo escucha en bloques de 2 s — como una
-   radio de dos vías. Usar auriculares para evitar eco (ver limitación conocida).
-4. Anfitrión adentro de la casa; alejar al participante progresivamente.
+1. Teléfono A: tocar **"Esperar conexión"** (queda visible y a la espera).
+2. Teléfono B: tocar **"Buscar dispositivo"** → tocar a A en la lista
+   (se empareja si hace falta) → conecta de inmediato.
+3. Con "Mi micrófono" activo en ambos (por defecto lo está), cualquiera de
+   los dos puede hablar y el otro lo escucha en bloques de 2 s — como una
+   radio de dos vías. Usar auriculares para evitar eco (ver limitación
+   conocida); silencia tu micrófono con el toggle si solo quieres escuchar.
+4. Teléfono A adentro de la casa; alejar al teléfono B progresivamente.
 5. Observar RSSI (azul) decrecer y pérdida de paquetes (rojo) aumentar en la
    gráfica de CADA teléfono (cada uno mide su propio enlace de recepción), y
    las latencias por ráfaga en el panel correspondiente (capturas para el informe).
 6. El PLC y el filtro LP mantienen la reproducción continua incluso con RSSI < -75 dBm.
 
-**Modo alternativo (prueba unidireccional con señal controlada):** rol
-*Anfitrión* → modo *Archivo WAV* → seleccionar el `.wav` → el participante
-solo escucha (sin su propio micrófono), útil para repetir el experimento
-con una señal de referencia idéntica en cada corrida.
+**Modo alternativo (prueba unidireccional con señal controlada):** en el
+teléfono que va a "Esperar conexión", marcar la casilla **"Modo
+laboratorio"** y seleccionar un `.wav` antes de tocar "Esperar conexión" —
+transmitirá ese archivo en vez de su micrófono; el otro teléfono solo
+escucha, útil para repetir el experimento con una señal de referencia
+idéntica en cada corrida.
 
 **Métricas registradas (en cada teléfono, sobre su propio enlace de RX):**
 - RSSI en dBm (señal del canal físico)
@@ -220,3 +225,15 @@ con una señal de referencia idéntica en cada corrida.
   Fallback: variación aleatoria de ±0.5 dBm para demostración.
 - **flutter_bluetooth_serial**: la versión ^0.4.0 requiere `minSdkVersion 19`.
   Asegúrate de configurarlo en `android/app/build.gradle`.
+- **Robustez frente a cierres inesperados**: dos streams internos (eventos del
+  servidor SPP nativo y captura de micrófono) no tenían manejador `onError` —
+  un fallo nativo ahí se propagaba como excepción no capturada. Se agregaron
+  `onError` a ambos, más `runZonedGuarded` + `FlutterError.onError` +
+  `PlatformDispatcher.instance.onError` en `main.dart` como red de seguridad
+  global. `AudioCaptureService` también fuerza reabrir el recorder nativo desde
+  cero si un intento de arranque falla, en vez de reintentar sobre una
+  instancia potencialmente corrupta.
+- **Micrófono silenciable en vivo**: `BluetoothManager.setMicEnabled()` detiene
+  o arranca la captura real (no solo deja de enviar), así que el indicador de
+  micrófono del sistema operativo refleja el estado real — se puede silenciar
+  antes de conectar o en plena conversación.

@@ -3,12 +3,13 @@
 // Pantalla principal — Dashboard de análisis DSP/BT en tiempo real.
 //
 // Secciones:
-//   1. Header con selector de rol de conexión (Anfitrión / Participante).
-//   2. Modo de sesión (conversación bidireccional / archivo WAV) + toggle de mic.
-//   3. Selector de dispositivo BT emparejado.
+//   1. Header.
+//   2. Mi micrófono (siempre visible, silenciable en cualquier momento).
+//   3. Conectar: "Esperar conexión" / "Buscar dispositivo" + lista + modo
+//      laboratorio opcional (archivo .wav). Se oculta una vez conectado.
 //   4. Panel de latencias y métricas en tiempo real (RSSI, Packet Loss, Buffer).
 //   5. Gráfica dinámica RSSI vs Packet Loss (fl_chart LineChart).
-//   6. Botón de inicio / detención de sesión.
+//   6. Botón de finalizar sesión (solo mientras está activa).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'package:fl_chart/fl_chart.dart';
@@ -56,15 +57,9 @@ class UiDashboard extends StatelessWidget {
             children: const [
               _HeaderSection(),
               SizedBox(height: 16),
-              _RoleSelectorCard(),
-              SizedBox(height: 12),
-              _TxSourceCard(),
-              SizedBox(height: 12),
               _MicToggleCard(),
               SizedBox(height: 12),
-              _WavFileCard(),
-              SizedBox(height: 12),
-              _BtConnectivityCard(),
+              _ConnectCard(),
               SizedBox(height: 12),
               _LatencyCard(),
               SizedBox(height: 12),
@@ -72,7 +67,7 @@ class UiDashboard extends StatelessWidget {
               SizedBox(height: 12),
               _RealtimeChartCard(),
               SizedBox(height: 16),
-              _SessionControlButton(),
+              _StopSessionButton(),
               SizedBox(height: 24),
             ],
           ),
@@ -185,34 +180,168 @@ class _Card extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SELECTOR DE ROL
+// TOGGLE DE MICRÓFONO PROPIO — siempre visible, silenciable en cualquier
+// momento (antes de conectar o en plena conversación).
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _RoleSelectorCard extends StatelessWidget {
-  const _RoleSelectorCard();
+class _MicToggleCard extends StatelessWidget {
+  const _MicToggleCard();
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
 
     return _Card(
-      title: 'ROL DE CONEXIÓN (ambos hablan y escuchan)',
-      icon: Icons.devices,
+      title: 'MI MICRÓFONO',
+      icon: Icons.mic_rounded,
       child: Row(
         children: [
-          _RoleButton(
-            label: 'Anfitrión',
-            icon: Icons.upload_rounded,
-            selected: state.role == DeviceRole.transmitter,
-            onTap: () => state.setRole(DeviceRole.transmitter),
+          Expanded(
+            child: Text(
+              state.micEnabled
+                  ? 'Activo: hablas en ráfagas de ${kBurstDurationMs ~/ 1000} s.'
+                  : 'Silenciado: solo escuchas.',
+              style: const TextStyle(color: _C.textMuted, fontSize: 12),
+            ),
           ),
-          const SizedBox(width: 10),
-          _RoleButton(
-            label: 'Participante',
-            icon: Icons.download_rounded,
-            selected: state.role == DeviceRole.receiver,
-            onTap: () => state.setRole(DeviceRole.receiver),
+          Switch(
+            value: state.micEnabled,
+            activeThumbColor: _C.accentGreen,
+            onChanged: (v) => state.setMicEnabled(v),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONECTAR — un único flujo, sin elegir "quién habla y quién escucha"
+// (ambos hacen ambas cosas). Solo define cómo se establece el enlace:
+// esperar a que alguien se conecte, o buscar y conectarse a alguien.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _ConnectCard extends StatelessWidget {
+  const _ConnectCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (state.isActive) return const SizedBox.shrink();
+
+    return _Card(
+      title: 'CONECTAR',
+      icon: Icons.bluetooth_rounded,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          GestureDetector(
+            onTap: () => state.setWavLabMode(!state.wavLabMode),
+            child: Row(
+              children: [
+                Icon(
+                  state.wavLabMode
+                      ? Icons.check_box_rounded
+                      : Icons.check_box_outline_blank_rounded,
+                  size: 18,
+                  color: state.wavLabMode ? _C.accent : _C.textMuted,
+                ),
+                const SizedBox(width: 6),
+                const Expanded(
+                  child: Text(
+                    'Modo laboratorio: transmitir un archivo .wav en vez de mi voz '
+                    '(solo aplica si espero la conexión)',
+                    style: TextStyle(color: _C.textMuted, fontSize: 11),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (state.wavLabMode) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: _C.surfaceAlt,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: _C.border),
+                    ),
+                    child: Text(
+                      state.wavFileName,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        color: _C.textPrimary,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                _ActionButton(
+                  label: 'Seleccionar',
+                  icon: Icons.folder_open_rounded,
+                  onTap: state.pickWavFile,
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              _RoleButton(
+                label: 'Esperar conexión',
+                icon: Icons.wifi_tethering_rounded,
+                selected: false,
+                onTap: () async {
+                  await state.makeDiscoverable();
+                  await state.waitForConnection();
+                },
+              ),
+              const SizedBox(width: 10),
+              _RoleButton(
+                label: state.isDiscovering ? 'Buscando…' : 'Buscar dispositivo',
+                icon: state.isDiscovering
+                    ? Icons.radar_rounded
+                    : Icons.search_rounded,
+                selected: state.isDiscovering,
+                onTap: state.isDiscovering ? state.stopScan : state.startScan,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (state.isDiscovering)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: LinearProgressIndicator(
+                backgroundColor: _C.surfaceAlt,
+                valueColor: AlwaysStoppedAnimation<Color>(_C.accent),
+                minHeight: 3,
+              ),
+            ),
+          if (state.devices.isNotEmpty)
+            ...state.devices.map(
+              (device) => _DeviceTile(
+                device: device,
+                onTap: () => state.connectToDevice(device),
+              ),
+            )
+          else if (state.isDiscovering)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'Buscando cerca… asegúrate de que el otro teléfono esté '
+                'esperando conexión.',
+                style: TextStyle(color: _C.textMuted, fontSize: 12),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          const SizedBox(height: 8),
+          _StatusBadge(message: state.statusMessage),
         ],
       ),
     );
@@ -254,8 +383,9 @@ class _RoleButton extends StatelessWidget {
               const SizedBox(height: 6),
               Text(
                 label,
+                textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: 12,
                   fontWeight: FontWeight.w600,
                   color: selected ? _C.accent : _C.textMuted,
                 ),
@@ -268,249 +398,12 @@ class _RoleButton extends StatelessWidget {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CARD DE MODO DE SESIÓN (solo Anfitrión)
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _TxSourceCard extends StatelessWidget {
-  const _TxSourceCard();
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    if (state.role != DeviceRole.transmitter) return const SizedBox.shrink();
-
-    return _Card(
-      title: 'MODO DE SESIÓN (solo anfitrión)',
-      icon: Icons.graphic_eq_rounded,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              _RoleButton(
-                label: 'Conversación',
-                icon: Icons.mic_rounded,
-                selected: state.txSource == AudioTxSource.microphone,
-                onTap: () => state.setTxSource(AudioTxSource.microphone),
-              ),
-              const SizedBox(width: 10),
-              _RoleButton(
-                label: 'Archivo WAV',
-                icon: Icons.audio_file_rounded,
-                selected: state.txSource == AudioTxSource.wavFile,
-                onTap: () => state.setTxSource(AudioTxSource.wavFile),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            state.txSource == AudioTxSource.microphone
-                ? 'Bidireccional: ambos lados hablan y escuchan por micrófono.'
-                : 'Unidireccional: solo el anfitrión transmite el archivo (señal de prueba controlada para el informe).',
-            style: const TextStyle(color: _C.textMuted, fontSize: 11),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TOGGLE DE MICRÓFONO PROPIO (ambos roles, salvo anfitrión en modo WAV)
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _MicToggleCard extends StatelessWidget {
-  const _MicToggleCard();
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
-    final hostInWavMode = state.role == DeviceRole.transmitter &&
-        state.txSource == AudioTxSource.wavFile;
-    if (hostInWavMode) return const SizedBox.shrink();
-
-    return _Card(
-      title: 'MI MICRÓFONO',
-      icon: Icons.mic_rounded,
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              state.micEnabled
-                  ? 'Activo: este teléfono también habla (ráfagas de ${kBurstDurationMs ~/ 1000} s).'
-                  : 'Desactivado: este teléfono solo escucha.',
-              style: const TextStyle(color: _C.textMuted, fontSize: 12),
-            ),
-          ),
-          Switch(
-            value: state.micEnabled,
-            activeThumbColor: _C.accentGreen,
-            onChanged: state.isActive ? null : state.setMicEnabled,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CARD DE ARCHIVO WAV
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _WavFileCard extends StatelessWidget {
-  const _WavFileCard();
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    if (state.role != DeviceRole.transmitter ||
-        state.txSource != AudioTxSource.wavFile) {
-      return const SizedBox.shrink();
-    }
-
-    return _Card(
-      title: 'ARCHIVO DE AUDIO',
-      icon: Icons.audio_file_rounded,
-      child: Row(
-        children: [
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: _C.surfaceAlt,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: _C.border),
-              ),
-              child: Text(
-                state.wavFileName,
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 12,
-                  color: _C.textPrimary,
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          _ActionButton(
-            label: 'Seleccionar',
-            icon: Icons.folder_open_rounded,
-            onTap: state.pickWavFile,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CONECTIVIDAD BLUETOOTH P2P
-//   Anfitrión   : activar BT + hacerse visible (espera conexión entrante).
-//   Participante: activar BT + escanear + seleccionar/emparejar al anfitrión.
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _BtConnectivityCard extends StatelessWidget {
-  const _BtConnectivityCard();
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
-
-    final isReceiver = state.role == DeviceRole.receiver;
-
-    return _Card(
-      title: 'CONECTIVIDAD BLUETOOTH',
-      icon: Icons.bluetooth_rounded,
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: _ActionButton(
-                  label: 'Activar BT',
-                  icon: Icons.bluetooth_rounded,
-                  onTap: state.enableBluetooth,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _ActionButton(
-                  label: 'Visible',
-                  icon: Icons.visibility_rounded,
-                  onTap: state.makeDiscoverable,
-                ),
-              ),
-              if (isReceiver) ...[
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _ActionButton(
-                    label: state.isDiscovering ? 'Detener' : 'Escanear',
-                    icon: state.isDiscovering
-                        ? Icons.stop_rounded
-                        : Icons.radar_rounded,
-                    onTap: state.isDiscovering ? state.stopScan : state.startScan,
-                  ),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 10),
-          if (isReceiver) ...[
-            if (state.isDiscovering)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 8),
-                child: LinearProgressIndicator(
-                  backgroundColor: _C.surfaceAlt,
-                  valueColor: AlwaysStoppedAnimation<Color>(_C.accent),
-                  minHeight: 3,
-                ),
-              ),
-            if (state.devices.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text(
-                  'Sin dispositivos. Pulsa "Escanear" con el emisor visible.',
-                  style: TextStyle(color: _C.textMuted, fontSize: 13),
-                  textAlign: TextAlign.center,
-                ),
-              )
-            else
-              ...state.devices.map(
-                (device) => _DeviceTile(
-                  device: device,
-                  isSelected: state.selectedDevice?.address == device.address,
-                  onTap: () => state.selectDevice(device),
-                ),
-              ),
-          ] else
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 4),
-              child: Text(
-                'Hazte visible y pulsa "Iniciar sesión": el anfitrión queda '
-                'esperando la conexión del participante.',
-                style: TextStyle(color: _C.textMuted, fontSize: 12),
-              ),
-            ),
-          const SizedBox(height: 8),
-          _StatusBadge(message: state.statusMessage),
-        ],
-      ),
-    );
-  }
-}
-
 class _DeviceTile extends StatelessWidget {
   final BtDeviceInfo device;
-  final bool isSelected;
   final VoidCallback onTap;
 
   const _DeviceTile({
     required this.device,
-    required this.isSelected,
     required this.onTap,
   });
 
@@ -518,16 +411,13 @@ class _DeviceTile extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 150),
+      child: Container(
         margin: const EdgeInsets.only(bottom: 6),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
-          color: isSelected ? _C.accent.withOpacity(0.1) : _C.surfaceAlt,
+          color: _C.surfaceAlt,
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: isSelected ? _C.accent : _C.border,
-          ),
+          border: Border.all(color: _C.border),
         ),
         child: Row(
           children: [
@@ -536,7 +426,7 @@ class _DeviceTile extends StatelessWidget {
                   ? Icons.bluetooth_connected_rounded
                   : Icons.bluetooth_searching_rounded,
               size: 16,
-              color: isSelected ? _C.accent : _C.textMuted,
+              color: _C.textMuted,
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -545,9 +435,9 @@ class _DeviceTile extends StatelessWidget {
                 children: [
                   Text(
                     device.name,
-                    style: TextStyle(
+                    style: const TextStyle(
                       fontSize: 13,
-                      color: isSelected ? _C.textPrimary : _C.textMuted,
+                      color: _C.textPrimary,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -572,8 +462,7 @@ class _DeviceTile extends StatelessWidget {
                   style: TextStyle(fontSize: 10, color: _C.accentAmber),
                 ),
               ),
-            if (isSelected)
-              const Icon(Icons.check_circle, size: 16, color: _C.accentGreen),
+            const Icon(Icons.chevron_right_rounded, size: 18, color: _C.textMuted),
           ],
         ),
       ),
@@ -591,7 +480,7 @@ class _LatencyCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
+    if (!state.isActive) return const SizedBox.shrink();
 
     return _Card(
       title: 'LATENCIA DE TRANSMISIÓN POR RÁFAGA',
@@ -674,9 +563,9 @@ class _MetricsPanelCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    // Ambos roles reciben y reproducen audio (bidireccional), así que ambos
-    // deben ver las métricas de SU PROPIO enlace de recepción.
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
+    // Ambos lados reciben y reproducen audio (bidireccional), así que ambos
+    // ven las métricas de SU PROPIO enlace de recepción.
+    if (!state.isActive) return const SizedBox.shrink();
 
     final m = state.metrics;
 
@@ -827,7 +716,7 @@ class _RealtimeChartCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
+    if (!state.isActive) return const SizedBox.shrink();
 
     final history = state.chartHistory;
 
@@ -989,77 +878,38 @@ class _RealtimeChartCard extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BOTÓN DE CONTROL DE SESIÓN
+// BOTÓN DE FINALIZAR SESIÓN
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _SessionControlButton extends StatelessWidget {
-  const _SessionControlButton();
+class _StopSessionButton extends StatelessWidget {
+  const _StopSessionButton();
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-
-    if (state.role == DeviceRole.none) return const SizedBox.shrink();
-
-    // Anfitrión: queda esperando conexión (no selecciona dispositivo); solo
-    // requiere archivo si el modo es WAV. Participante: requiere anfitrión elegido.
-    final canStart = !state.isActive &&
-        (state.role == DeviceRole.transmitter
-            ? (state.txSource == AudioTxSource.microphone ||
-                state.wavFilePath != null)
-            : state.selectedDevice != null);
+    if (!state.isActive) return const SizedBox.shrink();
 
     return GestureDetector(
-      onTap: () async {
-        if (state.isActive) {
-          await state.stopSession();
-        } else if (canStart) {
-          final granted = await state.requestAllPermissions();
-          if (granted) await state.startSession();
-        }
-      },
+      onTap: state.stopSession,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         height: 52,
         decoration: BoxDecoration(
-          color: state.isActive
-              ? _C.accentRed.withOpacity(0.15)
-              : canStart
-                  ? _C.accentGreen.withOpacity(0.15)
-                  : _C.surfaceAlt,
+          color: _C.accentRed.withOpacity(0.15),
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: state.isActive
-                ? _C.accentRed
-                : canStart
-                    ? _C.accentGreen
-                    : _C.border,
-            width: 1.5,
-          ),
+          border: Border.all(color: _C.accentRed, width: 1.5),
         ),
-        child: Row(
+        child: const Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(
-              state.isActive ? Icons.stop_circle_rounded : Icons.play_circle_rounded,
-              color: state.isActive
-                  ? _C.accentRed
-                  : canStart
-                      ? _C.accentGreen
-                      : _C.textMuted,
-              size: 22,
-            ),
-            const SizedBox(width: 8),
+            Icon(Icons.stop_circle_rounded, color: _C.accentRed, size: 22),
+            SizedBox(width: 8),
             Text(
-              state.isActive ? 'Detener sesión' : 'Iniciar sesión',
+              'Finalizar sesión',
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.bold,
-                color: state.isActive
-                    ? _C.accentRed
-                    : canStart
-                        ? _C.accentGreen
-                        : _C.textMuted,
+                color: _C.accentRed,
               ),
             ),
           ],

@@ -182,12 +182,6 @@ class LatencyMetric {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FUENTE DE AUDIO DEL EMISOR
-// ─────────────────────────────────────────────────────────────────────────────
-
-enum AudioTxSource { microphone, wavFile }
-
-// ─────────────────────────────────────────────────────────────────────────────
 // DISPOSITIVO BLUETOOTH (unifica emparejados y descubiertos)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -365,12 +359,6 @@ class WavHeader {
       'WavHeader(${sampleRate}Hz, ${numChannels}ch, ${bitsPerSample}bit, '
       '${durationSeconds.toStringAsFixed(2)}s)';
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ENUM: ROL DEL DISPOSITIVO
-// ─────────────────────────────────────────────────────────────────────────────
-
-enum DeviceRole { none, transmitter, receiver }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUNTO DE DATOS PARA GRÁFICA

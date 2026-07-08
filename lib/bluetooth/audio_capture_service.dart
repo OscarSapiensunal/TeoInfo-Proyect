@@ -41,12 +41,29 @@ class AudioCaptureService {
     if (_isCapturing) await stopCapture();
 
     _pcmController = StreamController<Uint8List>();
-    await _recorder.startRecorder(
-      codec: Codec.pcm16,
-      toStream: _pcmController!.sink,
-      sampleRate: sampleRate,
-      numChannels: numChannels,
-    );
+    try {
+      await _recorder.startRecorder(
+        codec: Codec.pcm16,
+        toStream: _pcmController!.sink,
+        sampleRate: sampleRate,
+        numChannels: numChannels,
+      );
+    } catch (e) {
+      _log.e('Error arrancando la grabadora: $e');
+      await _pcmController?.close();
+      _pcmController = null;
+      // Un fallo aquí puede dejar el recorder nativo en un estado inconsistente;
+      // forzamos reabrirlo desde cero en el próximo intento en lugar de
+      // reutilizar una instancia potencialmente corrupta (evita que reintentos
+      // sucesivos fallen en silencio o de forma cada vez más impredecible).
+      try {
+        await _recorder.closeRecorder();
+      } catch (_) {
+        // Ignorado: ya estamos en manejo de error, closeRecorder es best-effort.
+      }
+      _isOpen = false;
+      rethrow;
+    }
     _isCapturing = true;
     _log.i('Captura de micrófono iniciada: ${sampleRate}Hz ${numChannels}ch PCM16');
     return _pcmController!.stream;

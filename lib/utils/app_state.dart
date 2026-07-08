@@ -2,18 +2,18 @@
 //
 // Estado global de la aplicación (ChangeNotifier).
 //
-// Flujo P2P bidireccional:
-//   · Anfitrión   : activar BT → hacerse visible → iniciar sesión (queda en
-//                   espera como servidor SPP).
-//   · Participante: activar BT → escanear → seleccionar/emparejar anfitrión →
-//                   iniciar sesión (conecta como cliente).
+// Flujo P2P simplificado: no hay "rol" que elegir de antemano. Cualquier
+// teléfono puede:
+//   · esperar()      : queda visible y a la espera de una conexión entrante.
+//   · connectToDevice(): busca y se conecta directamente a otro teléfono.
 //
-// Una vez conectados, ambos lados reciben y reproducen audio SIEMPRE; si el
-// propio micrófono está habilitado ([micEnabled]), también capturan y
-// transmiten su voz — así ambos pueden hablar y escuchar, como una radio de
-// dos vías. El modo "archivo WAV" es la excepción: unidireccional a
-// propósito (señal de prueba controlada para el informe), solo el anfitrión
-// la transmite.
+// Quien conecte primero define quién "escuchó" (host) y quién "buscó"
+// (cliente) solo a nivel de transporte — a efectos de la conversación es
+// irrelevante: una vez conectados, AMBOS lados reciben y reproducen audio
+// siempre, y ambos capturan/transmiten su propio micrófono si lo tienen
+// habilitado (mic vivo, se puede silenciar antes o durante la sesión). El
+// modo "archivo WAV" es la única excepción intencional: unidireccional,
+// para tener una señal de prueba controlada en el informe.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';
@@ -35,18 +35,17 @@ class AppState extends ChangeNotifier {
   final BluetoothManager btManager = BluetoothManager();
   final AudioPlayerService audioPlayer = AudioPlayerService();
 
-  DeviceRole _role = DeviceRole.none;
-  DeviceRole get role => _role;
-
-  AudioTxSource _txSource = AudioTxSource.microphone;
-  AudioTxSource get txSource => _txSource;
-
   /// Si está habilitado, este dispositivo captura y transmite su propio
-  /// micrófono (independiente del rol) — es lo que hace la conversación
-  /// bidireccional. Se ignora en modo archivo WAV para el participante,
-  /// que en ese modo siempre es solo oyente.
+  /// micrófono. Se puede cambiar antes de conectar o EN VIVO durante una
+  /// sesión activa (silenciarse/hablar en cualquier momento).
   bool _micEnabled = true;
   bool get micEnabled => _micEnabled;
+
+  /// Modo laboratorio: si está activo y este dispositivo termina esperando
+  /// la conexión (host), transmite el archivo .wav seleccionado en lugar de
+  /// su micrófono — señal de prueba controlada y repetible para el informe.
+  bool _wavLabMode = false;
+  bool get wavLabMode => _wavLabMode;
 
   String? _wavFilePath;
   WavHeader? _wavHeader;
@@ -57,7 +56,6 @@ class AppState extends ChangeNotifier {
 
   // ── Dispositivos BT (emparejados + descubiertos) ─────────────────────────
   final Map<String, BtDeviceInfo> _devices = {};
-  BtDeviceInfo? _selectedDevice;
   List<BtDeviceInfo> get devices {
     final list = _devices.values.toList()
       ..sort((a, b) {
@@ -67,15 +65,13 @@ class AppState extends ChangeNotifier {
     return list;
   }
 
-  BtDeviceInfo? get selectedDevice => _selectedDevice;
-
   bool _isDiscovering = false;
   bool get isDiscovering => _isDiscovering;
   StreamSubscription<BluetoothDiscoveryResult>? _discoverySub;
 
   bool _isConnected = false;
   bool _isActive    = false;
-  String _statusMessage = 'Selecciona un rol para comenzar';
+  String _statusMessage = 'Activa Bluetooth para comenzar';
   bool get isConnected  => _isConnected;
   bool get isActive     => _isActive;
   String get statusMessage => _statusMessage;
@@ -130,23 +126,21 @@ class AppState extends ChangeNotifier {
     return allGranted;
   }
 
-  // ── Rol y fuente ──────────────────────────────────────────────────────────
-  void setRole(DeviceRole role) {
-    _role = role;
-    _statusMessage = role == DeviceRole.transmitter
-        ? 'Modo Anfitrión. Activa BT, hazte visible e inicia sesión.'
-        : 'Modo Participante. Escanea y selecciona al anfitrión.';
-    notifyListeners();
-    _refreshPairedDevices();
-  }
+  // ── Micrófono y modo laboratorio ──────────────────────────────────────────
 
-  void setTxSource(AudioTxSource source) {
-    _txSource = source;
-    notifyListeners();
-  }
-
-  void setMicEnabled(bool enabled) {
+  /// Habilita/deshabilita el micrófono propio. Funciona antes de conectar
+  /// (decide si se arranca la captura) y también EN VIVO durante una sesión
+  /// activa (silencia/reactiva sin necesidad de reconectar).
+  Future<void> setMicEnabled(bool enabled) async {
     _micEnabled = enabled;
+    notifyListeners();
+    if (_isActive) {
+      await btManager.setMicEnabled(enabled);
+    }
+  }
+
+  void setWavLabMode(bool enabled) {
+    _wavLabMode = enabled;
     notifyListeners();
   }
 
@@ -192,8 +186,6 @@ class AppState extends ChangeNotifier {
     final granted = await requestAllPermissions();
     if (!granted) return;
     await btManager.requestDiscoverable();
-    _statusMessage = 'Dispositivo visible por 120 s';
-    notifyListeners();
   }
 
   Future<void> startScan() async {
@@ -204,7 +196,7 @@ class AppState extends ChangeNotifier {
     // Conservar emparejados; limpiar descubiertos previos
     _devices.removeWhere((_, d) => !d.bonded);
     _isDiscovering = true;
-    _statusMessage = 'Escaneando dispositivos cercanos…';
+    _statusMessage = 'Buscando dispositivos cercanos…';
     notifyListeners();
 
     _discoverySub = btManager.startDiscovery().listen(
@@ -221,12 +213,12 @@ class AppState extends ChangeNotifier {
       onDone: () {
         _isDiscovering = false;
         _statusMessage =
-            'Escaneo finalizado: ${_devices.length} dispositivo(s)';
+            'Búsqueda finalizada: ${_devices.length} dispositivo(s)';
         notifyListeners();
       },
       onError: (Object e) {
         _isDiscovering = false;
-        _statusMessage = 'Error de escaneo: $e';
+        _statusMessage = 'Error de búsqueda: $e';
         _log.e('Error en discovery: $e');
         notifyListeners();
       },
@@ -256,9 +248,41 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Selecciona un dispositivo; si no está emparejado, envía la solicitud
-  /// de emparejamiento primero (aparece el diálogo del sistema en ambos).
-  Future<void> selectDevice(BtDeviceInfo device) async {
+  // ── Sesión ────────────────────────────────────────────────────────────────
+
+  /// Queda a la espera de una conexión entrante (se hace visible y arranca
+  /// el servidor). Si [wavLabMode] está activo, transmitirá el archivo .wav
+  /// seleccionado en cuanto alguien se conecte; en caso contrario, habla por
+  /// su propio micrófono (si [micEnabled]) y escucha lo que le llegue.
+  Future<void> waitForConnection() async {
+    if (_wavLabMode && (_wavFilePath == null || _wavHeader == null)) {
+      _statusMessage = 'Selecciona un archivo .wav primero';
+      notifyListeners();
+      return;
+    }
+    final granted = await requestAllPermissions();
+    if (!granted) return;
+
+    await stopScan();
+    await btManager.requestEnable();
+    await btManager.requestDiscoverable();
+    await _beginActiveSession();
+
+    await btManager.startAsHost(
+      onWavInfo: _onWavInfo,
+      micEnabled: !_wavLabMode && _micEnabled,
+      wavFilePath: _wavLabMode ? _wavFilePath : null,
+      wavHeader: _wavLabMode ? _wavHeader : null,
+    );
+  }
+
+  /// Se conecta directamente al dispositivo [device] (emparejando primero
+  /// si hace falta) y comienza la sesión de inmediato.
+  Future<void> connectToDevice(BtDeviceInfo device) async {
+    final granted = await requestAllPermissions();
+    if (!granted) return;
+    await stopScan();
+
     if (!device.bonded) {
       _statusMessage = 'Emparejando con ${device.name}…';
       notifyListeners();
@@ -269,35 +293,24 @@ class AppState extends ChangeNotifier {
         return;
       }
       _devices[device.address] = device.copyWith(bonded: true);
-      _statusMessage = 'Emparejado con ${device.name}';
     }
-    _selectedDevice = _devices[device.address] ?? device;
-    notifyListeners();
+
+    await _beginActiveSession();
+    try {
+      await btManager.joinAsClient(
+        address: device.address,
+        name: device.name,
+        onWavInfo: _onWavInfo,
+        micEnabled: _micEnabled,
+      );
+    } catch (e) {
+      _isActive = false;
+      _statusMessage = 'No se pudo conectar a ${device.name}: $e';
+      notifyListeners();
+    }
   }
 
-  // ── Sesión ────────────────────────────────────────────────────────────────
-  //
-  // Ambos roles reproducen audio SIEMPRE (por eso audioPlayer.init() corre
-  // para los dos). Si _micEnabled, además capturan y transmiten su propio
-  // micrófono — así ambos lados pueden hablar y escuchar (conversación
-  // bidireccional). El modo "archivo WAV" es la excepción intencional:
-  // solo el anfitrión transmite (señal de prueba controlada para el informe).
-  Future<void> startSession() async {
-    if (_role == DeviceRole.receiver && _selectedDevice == null) {
-      _statusMessage = 'Selecciona el dispositivo anfitrión primero';
-      notifyListeners();
-      return;
-    }
-    final bool wavMode = _txSource == AudioTxSource.wavFile;
-    if (_role == DeviceRole.transmitter &&
-        wavMode &&
-        (_wavFilePath == null || _wavHeader == null)) {
-      _statusMessage = 'Selecciona un archivo .wav primero';
-      notifyListeners();
-      return;
-    }
-
-    await stopScan();
+  Future<void> _beginActiveSession() async {
     _sessionStart = DateTime.now();
     _chartHistory.clear();
     _latencyLog.clear();
@@ -308,28 +321,18 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     _listenToStreams();
     await audioPlayer.init();
+  }
 
-    Future<void> onWavInfo(int sr, int nc, int bps) async {
+  Future<void> _onWavInfo(int sampleRate, int numChannels, int bitsPerSample) async {
+    try {
       await audioPlayer.startStreaming(
-        sampleRate: sr, numChannels: nc, bitsPerSample: bps,
+        sampleRate: sampleRate, numChannels: numChannels, bitsPerSample: bitsPerSample,
       );
-      _log.i('Motor de audio: ${sr}Hz ${nc}ch ${bps}bit');
-    }
-
-    if (_role == DeviceRole.transmitter) {
-      await btManager.startAsHost(
-        onWavInfo: onWavInfo,
-        micEnabled: !wavMode && _micEnabled,
-        wavFilePath: wavMode ? _wavFilePath : null,
-        wavHeader: wavMode ? _wavHeader : null,
-      );
-    } else {
-      await btManager.joinAsClient(
-        address: _selectedDevice!.address,
-        name: _selectedDevice!.name,
-        onWavInfo: onWavInfo,
-        micEnabled: _micEnabled,
-      );
+      _log.i('Motor de audio: ${sampleRate}Hz ${numChannels}ch ${bitsPerSample}bit');
+    } catch (e) {
+      _log.e('Error iniciando motor de audio: $e');
+      _statusMessage = 'Error iniciando audio: $e';
+      notifyListeners();
     }
   }
 

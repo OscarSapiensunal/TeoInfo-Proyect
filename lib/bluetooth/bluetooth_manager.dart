@@ -189,59 +189,65 @@ class BluetoothManager {
     _resetRxState();
     _resetTxState();
 
-    _serverEventsSub = _sppServer.events().listen((event) async {
-      switch (event.type) {
-        case SppServerEventType.waiting:
-          _statusController.add(
-              'Esperando conexión entrante… (hazte visible si no apareces)');
-          break;
+    _serverEventsSub = _sppServer.events().listen(
+      (event) async {
+        switch (event.type) {
+          case SppServerEventType.waiting:
+            _statusController.add(
+                'Esperando conexión entrante… (hazte visible si no apareces)');
+            break;
 
-        case SppServerEventType.connected:
-          _serverTxActive = true;
-          _log.i(
-              'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
-          _statusController.add('Conectado: ${event.deviceName}');
-          try {
-            _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
-            if (wavFilePath != null && wavHeader != null) {
-              await _sendStreamInfoPacket(
-                sampleRate: wavHeader.sampleRate,
-                numChannels: wavHeader.numChannels,
-                bitsPerSample: wavHeader.bitsPerSample,
-              );
-              unawaited(_transmitWav(
-                  wavFilePath: wavFilePath, wavHeader: wavHeader));
-            } else if (micEnabled) {
-              await _sendStreamInfoPacket(
-                sampleRate: kMicSampleRate,
-                numChannels: kMicNumChannels,
-                bitsPerSample: kMicBitsPerSample,
-              );
-              await _beginMicTx();
+          case SppServerEventType.connected:
+            _serverTxActive = true;
+            _log.i(
+                'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
+            _statusController.add('Conectado: ${event.deviceName}');
+            try {
+              _beginPlayback(
+                  kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+              if (wavFilePath != null && wavHeader != null) {
+                await _sendStreamInfoPacket(
+                  sampleRate: wavHeader.sampleRate,
+                  numChannels: wavHeader.numChannels,
+                  bitsPerSample: wavHeader.bitsPerSample,
+                );
+                unawaited(_transmitWav(
+                    wavFilePath: wavFilePath, wavHeader: wavHeader));
+              } else {
+                await setMicEnabled(micEnabled);
+              }
+            } catch (e, st) {
+              _log.e('Error iniciando sesión: $e', error: e, stackTrace: st);
+              _statusController.add('Error iniciando sesión: $e');
             }
-          } catch (e) {
-            _log.e('Error iniciando sesión: $e');
-            _statusController.add('Error iniciando sesión: $e');
-          }
-          break;
+            break;
 
-        case SppServerEventType.data:
-          if (event.bytes != null) _onIncomingBytes(event.bytes!);
-          break;
+          case SppServerEventType.data:
+            if (event.bytes != null) _onIncomingBytes(event.bytes!);
+            break;
 
-        case SppServerEventType.disconnected:
-          _serverTxActive = false;
-          _statusController.add('Participante desconectado');
-          await _capture.stopCapture();
-          break;
+          case SppServerEventType.disconnected:
+            _serverTxActive = false;
+            _statusController.add('Participante desconectado');
+            await _capture.stopCapture();
+            break;
 
-        case SppServerEventType.error:
-          _serverTxActive = false;
-          _log.e('Error servidor SPP: ${event.message}');
-          _statusController.add('Error BT: ${event.message}');
-          break;
-      }
-    });
+          case SppServerEventType.error:
+            _serverTxActive = false;
+            _log.e('Error servidor SPP: ${event.message}');
+            _statusController.add('Error BT: ${event.message}');
+            break;
+        }
+      },
+      onError: (Object e, StackTrace st) {
+        // Defensivo: un error no manejado en este stream (p. ej. una
+        // excepción nativa marshaled desde el EventChannel) no debe tumbar
+        // la app entera — se registra y se refleja en el estado.
+        _log.e('Error en eventos del servidor SPP: $e', error: e, stackTrace: st);
+        _statusController.add('Error BT: $e');
+        _serverTxActive = false;
+      },
+    );
 
     await _sppServer.start();
     _statusController.add('Servidor SPP iniciado. Esperando…');
@@ -290,16 +296,9 @@ class BluetoothManager {
         cancelOnError: false,
       );
 
-      if (micEnabled) {
-        await _sendStreamInfoPacket(
-          sampleRate: kMicSampleRate,
-          numChannels: kMicNumChannels,
-          bitsPerSample: kMicBitsPerSample,
-        );
-        await _beginMicTx();
-      }
-    } catch (e) {
-      _log.e('Error uniéndose a la sesión: $e');
+      await setMicEnabled(micEnabled);
+    } catch (e, st) {
+      _log.e('Error uniéndose a la sesión: $e', error: e, stackTrace: st);
       _statusController.add('Error: $e');
       rethrow;
     }
@@ -309,11 +308,39 @@ class BluetoothManager {
   // TX — CAPTURA Y ENVÍO DEL MICRÓFONO PROPIO (ambos lados)
   // ──────────────────────────────────────────────────────────────────────────
 
-  Future<void> _beginMicTx() async {
-    final pcmStream = await _capture.startCapture();
-    _pcmSub = pcmStream.listen(_onPcmChunk);
-    _statusController
-        .add('Capturando voz en ráfagas de ${kBurstDurationMs ~/ 1000} s…');
+  /// Habilita/deshabilita el micrófono propio EN VIVO — antes de conectar o
+  /// durante una sesión activa. Al deshabilitar se detiene la captura por
+  /// completo (apaga el indicador de micrófono del sistema, no solo deja de
+  /// enviar); al habilitar se arranca bajo demanda si aún no estaba corriendo.
+  /// Cualquier fallo nativo al arrancar el micrófono queda contenido aquí:
+  /// se registra y refleja en el estado en vez de propagarse sin control.
+  Future<void> setMicEnabled(bool enabled) async {
+    if (enabled) {
+      if (_pcmSub != null) return; // ya está corriendo
+      try {
+        final pcmStream = await _capture.startCapture();
+        _pcmSub = pcmStream.listen(
+          _onPcmChunk,
+          onError: (Object e, StackTrace st) {
+            _log.w('Error en captura de audio: $e', error: e, stackTrace: st);
+            _statusController.add('Error de micrófono: $e');
+          },
+        );
+        _statusController.add(
+            'Capturando voz en ráfagas de ${kBurstDurationMs ~/ 1000} s…');
+      } catch (e, st) {
+        _log.w('No se pudo iniciar el micrófono: $e', error: e, stackTrace: st);
+        _statusController.add('No se pudo activar el micrófono: $e');
+      }
+    } else {
+      await _pcmSub?.cancel();
+      _pcmSub = null;
+      try {
+        await _capture.stopCapture();
+      } catch (e) {
+        _log.w('Error deteniendo captura de audio: $e');
+      }
+    }
   }
 
   /// Acumula PCM del micrófono; al completar una ráfaga de 2 s la encola
