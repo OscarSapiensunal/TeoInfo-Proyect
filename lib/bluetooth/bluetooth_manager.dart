@@ -74,7 +74,7 @@ class BluetoothManager {
   int _rxSampleRate = kMicSampleRate;
   int _rxNumChannels = kMicNumChannels;
   int _rxBitsPerSample = kMicBitsPerSample;
-  void Function(int sr, int nc, int bps)? _onWavInfoCallback;
+  Future<void> Function(int sr, int nc, int bps)? _onWavInfoCallback;
 
   /// Drena el Jitter Buffer a ritmo constante (independiente de la llegada
   /// a ráfagas de los paquetes BT) para que la reproducción sea uniforme y
@@ -179,7 +179,8 @@ class BluetoothManager {
   /// está activa — así el anfitrión también escucha lo que el participante
   /// le hable de vuelta.
   Future<void> startAsHost({
-    required void Function(int sampleRate, int numChannels, int bitsPerSample)
+    required Future<void> Function(
+            int sampleRate, int numChannels, int bitsPerSample)
         onWavInfo,
     bool micEnabled = true,
     String? wavFilePath,
@@ -203,7 +204,7 @@ class BluetoothManager {
                 'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
             _statusController.add('Conectado: ${event.deviceName}');
             try {
-              _beginPlayback(
+              await _beginPlayback(
                   kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
               if (wavFilePath != null && wavHeader != null) {
                 await _sendStreamInfoPacket(
@@ -263,7 +264,8 @@ class BluetoothManager {
   Future<void> joinAsClient({
     required String address,
     required String name,
-    required void Function(int sampleRate, int numChannels, int bitsPerSample)
+    required Future<void> Function(
+            int sampleRate, int numChannels, int bitsPerSample)
         onWavInfo,
     bool micEnabled = true,
   }) async {
@@ -279,7 +281,7 @@ class BluetoothManager {
       _resetRxState();
       _resetTxState();
       _startRssiPolling(address);
-      _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+      await _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
 
       _connection!.input!.listen(
         _onIncomingBytes,
@@ -568,7 +570,7 @@ class BluetoothManager {
       final view = ByteData.sublistView(packet);
       final sr = view.getUint32(4, Endian.little);
       _log.i('Meta-paquete audio: ${sr}Hz, ${nc}ch, ${bps}bit');
-      _beginPlayback(sr, nc, bps);
+      unawaited(_beginPlayback(sr, nc, bps));
       return;
     }
 
@@ -708,13 +710,28 @@ class BluetoothManager {
   // REPRODUCCIÓN — DRENADO DEL JITTER BUFFER A RITMO CONSTANTE
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Fija el formato de audio entrante, notifica a la UI (para que arranque
-  /// el motor de reproducción) y arranca el drenado periódico del buffer.
-  void _beginPlayback(int sampleRate, int numChannels, int bitsPerSample) {
+  /// Fija el formato de audio entrante, ESPERA a que el motor de reproducción
+  /// termine de arrancar de verdad, y arranca el drenado periódico del buffer.
+  ///
+  /// CRÍTICO: hay que esperar (no disparar en fire-and-forget) antes de que
+  /// el llamador arranque el micrófono. En hardware real (visto en un
+  /// Motorola/MediaTek) arrancar el AudioTrack de reproducción y el
+  /// AudioRecord de captura casi al mismo instante desestabiliza el HAL de
+  /// audio nativo y produce un SIGSEGV dentro de `AudioTrack::write` — un
+  /// crash de proceso completo, no una excepción de Dart. El pequeño margen
+  /// tras confirmar el arranque del reproductor evita esa carrera.
+  Future<void> _beginPlayback(
+      int sampleRate, int numChannels, int bitsPerSample) async {
     _rxSampleRate = sampleRate;
     _rxNumChannels = numChannels;
     _rxBitsPerSample = bitsPerSample;
-    _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
+    try {
+      await _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
+    } catch (e, st) {
+      _log.e('Error arrancando el motor de audio: $e', error: e, stackTrace: st);
+      _statusController.add('Error de audio: $e');
+    }
+    await Future.delayed(const Duration(milliseconds: 300));
     _startPlaybackDrain();
   }
 
