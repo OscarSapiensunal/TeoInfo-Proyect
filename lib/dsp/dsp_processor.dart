@@ -21,8 +21,17 @@ import '../models/app_models.dart';
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Capacidad del Jitter Buffer en número de bloques de audio.
-/// 8 bloques × 1020 bytes × (1 muestra / 2 bytes) = ~4080 muestras de buffer.
-const int kJitterBufferCapacity = 16;
+///
+/// DEBE ser al menos tantos bloques como una ráfaga completa de voz
+/// (kBurstPcmBytes / kPayloadSize ≈ 63 bloques para 2 s a 16 kHz mono).
+/// Bluetooth entrega los 63 paquetes de una ráfaga casi de golpe (no
+/// espaciados en el tiempo); con una capacidad menor (16, el valor
+/// original), el buffer se llena y descarta con política drop-oldest la
+/// mayoría de esos paquetes ANTES de que el temporizador de reproducción
+/// alcance a drenarlos — el resultado audible es silencio la mayor parte
+/// de cada ráfaga, aunque las métricas de pérdida (que se miden al llegar
+/// el paquete, no al reproducirlo) sigan reportando datos correctos.
+const int kJitterBufferCapacity = 80;
 
 /// Umbral de RSSI (dBm) bajo el cual se activa PLC + ruido.
 /// -75 dBm es típico del límite interior/exterior de una casa.
