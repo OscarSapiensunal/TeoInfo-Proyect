@@ -204,8 +204,15 @@ class BluetoothManager {
                 'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
             _statusController.add('Conectado: ${event.deviceName}');
             try {
-              await _beginPlayback(
-                  kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+              // NO se arranca la reproducción "a ciegas" con el formato del
+              // micrófono por defecto aquí: eso causaba un doble arranque del
+              // reproductor (uno con el formato por defecto, otro al llegar
+              // el meta-paquete real en modo WAV) que corrompía el estado
+              // interno de flutter_sound y dejaba la reproducción muda el
+              // resto de la sesión (confirmado con logcat en hardware real).
+              // La reproducción arranca UNA sola vez, disparada por el
+              // meta-paquete que el otro lado envía al empezar a transmitir
+              // (ver _handleIncomingPacket).
               if (wavFilePath != null && wavHeader != null) {
                 await _sendStreamInfoPacket(
                   sampleRate: wavHeader.sampleRate,
@@ -281,7 +288,9 @@ class BluetoothManager {
       _resetRxState();
       _resetTxState();
       _startRssiPolling(address);
-      await _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+      // La reproducción arranca cuando llegue el meta-paquete del anfitrión
+      // (ver comentario en startAsHost sobre por qué NO se arranca aquí con
+      // un formato por defecto).
 
       _connection!.input!.listen(
         _onIncomingBytes,
@@ -320,6 +329,14 @@ class BluetoothManager {
     if (enabled) {
       if (_pcmSub != null) return; // ya está corriendo
       try {
+        // Anunciar el formato ANTES de capturar: es la única señal que le
+        // dice al otro lado que arranque SU reproducción (una sola vez, con
+        // el formato correcto) — ver nota en startAsHost/joinAsClient.
+        await _sendStreamInfoPacket(
+          sampleRate: kMicSampleRate,
+          numChannels: kMicNumChannels,
+          bitsPerSample: kMicBitsPerSample,
+        );
         final pcmStream = await _capture.startCapture();
         _pcmSub = pcmStream.listen(
           _onPcmChunk,

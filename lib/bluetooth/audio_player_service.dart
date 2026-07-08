@@ -48,6 +48,21 @@ class AudioPlayerService {
     int numChannels   = 1,
     int bitsPerSample = 16,
   }) async {
+    // Si ya se está reproduciendo con EXACTAMENTE el mismo formato, no hay
+    // nada que reconfigurar. Evitar el reinicio es importante: un stop()+
+    // start() repetido en poco tiempo (p. ej. dos meta-paquetes seguidos con
+    // el mismo formato) puede dejar el hilo escritor interno de flutter_sound
+    // esperando para siempre una señal nativa "needSomeFood" que nunca llega
+    // — silencio total el resto de la sesión, sin ningún error visible
+    // (confirmado con logcat en hardware real: 0 frames entregados al
+    // AudioTrack durante toda la llamada tras un reinicio).
+    if (_isPlaying &&
+        sampleRate == _sampleRate &&
+        numChannels == _numChannels &&
+        bitsPerSample == _bitsPerSample) {
+      return;
+    }
+
     if (!_isPlayerOpen) await init();
     if (_isPlaying) await stopStreaming();
 
@@ -77,10 +92,21 @@ class AudioPlayerService {
   /// interno de flutter_sound.
   ///
   /// [chunk] : bytes PCM Int16 LE, longitud variable.
+  ///
+  /// Con `timeout`: si `feedFromStream()` internamente queda esperando para
+  /// siempre una señal nativa que nunca llega (ver nota en [startStreaming]),
+  /// esto evita que la cadena de escrituras serializada de AppState quede
+  /// bloqueada de forma permanente — se sacrifica ese bloque puntual en vez
+  /// de perder el audio del resto de la sesión.
   Future<void> feedChunk(Uint8List chunk) async {
     if (!_isPlaying) return;
     try {
-      await _player.feedFromStream(chunk);
+      await _player.feedFromStream(chunk).timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {
+          _log.w('feedFromStream() sin responder tras 2 s — se descarta este bloque');
+        },
+      );
     } catch (e) {
       _log.w('Error alimentando chunk de audio: $e');
     }
