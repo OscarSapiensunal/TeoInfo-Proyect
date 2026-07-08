@@ -154,11 +154,17 @@ class AppState extends ChangeNotifier {
   }
 
   // ── WAV ───────────────────────────────────────────────────────────────────
+  //
+  // NOTA: `FileType.custom` + `allowedExtensions: ['wav']` es un problema
+  // documentado de file_picker — depende de que el proveedor de archivos
+  // del sistema (galería/gestor de archivos del fabricante) tenga bien
+  // mapeado el MIME type de .wav; en muchos dispositivos (confirmado en un
+  // Motorola) esto deja TODOS los archivos en gris, sin poder seleccionar
+  // ninguno. Se usa `FileType.any` (sin filtro) y se valida el contenido
+  // después con WavHeader.parse, que ya rechaza con un mensaje claro
+  // cualquier archivo que no sea un WAV válido.
   Future<void> pickWavFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['wav'],
-    );
+    final result = await FilePicker.platform.pickFiles(type: FileType.any);
     if (result == null || result.files.single.path == null) return;
     final path = result.files.single.path!;
     try {

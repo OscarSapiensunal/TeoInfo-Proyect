@@ -297,6 +297,7 @@ class _ConnectCard extends StatelessWidget {
                 label: 'Esperar conexión',
                 icon: Icons.wifi_tethering_rounded,
                 selected: false,
+                enabled: !state.wavLabMode || state.wavFilePath != null,
                 onTap: () async {
                   await state.makeDiscoverable();
                   await state.waitForConnection();
@@ -353,24 +354,30 @@ class _RoleButton extends StatelessWidget {
   final IconData icon;
   final bool selected;
   final VoidCallback onTap;
+  final bool enabled;
 
   const _RoleButton({
     required this.label,
     required this.icon,
     required this.selected,
     required this.onTap,
+    this.enabled = true,
   });
 
   @override
   Widget build(BuildContext context) {
     return Expanded(
       child: GestureDetector(
-        onTap: onTap,
+        onTap: enabled ? onTap : null,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           padding: const EdgeInsets.symmetric(vertical: 14),
           decoration: BoxDecoration(
-            color: selected ? _C.accent.withOpacity(0.15) : _C.surfaceAlt,
+            color: !enabled
+                ? _C.surfaceAlt.withOpacity(0.4)
+                : selected
+                    ? _C.accent.withOpacity(0.15)
+                    : _C.surfaceAlt,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(
               color: selected ? _C.accent : _C.border,
@@ -379,7 +386,13 @@ class _RoleButton extends StatelessWidget {
           ),
           child: Column(
             children: [
-              Icon(icon, color: selected ? _C.accent : _C.textMuted, size: 22),
+              Icon(icon,
+                  color: !enabled
+                      ? _C.textMuted.withOpacity(0.4)
+                      : selected
+                          ? _C.accent
+                          : _C.textMuted,
+                  size: 22),
               const SizedBox(height: 6),
               Text(
                 label,
@@ -387,7 +400,11 @@ class _RoleButton extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: selected ? _C.accent : _C.textMuted,
+                  color: !enabled
+                      ? _C.textMuted.withOpacity(0.4)
+                      : selected
+                          ? _C.accent
+                          : _C.textMuted,
                 ),
               ),
             ],
