@@ -102,15 +102,6 @@ class AppState extends ChangeNotifier {
   StreamSubscription<String>?         _statusSub;
   StreamSubscription<LatencyMetric>?  _latencySub;
 
-  /// Encadena las escrituras al reproductor para que NUNCA se solapen.
-  /// `feedFromStream()` de flutter_sound exige explícitamente esperar a que
-  /// cada llamada termine antes de la siguiente; el Timer que drena el
-  /// Jitter Buffer dispara cada ~32 ms sin saber si la escritura anterior ya
-  /// terminó, así que sin esta cola dos llamadas pueden solaparse si una
-  /// tarda más de 32 ms en hardware real — eso corrompe el estado interno
-  /// del plugin y provoca un SIGSEGV nativo en el hilo de escritura de audio.
-  Future<void> _feedChain = Future.value();
-
   // ── Permisos ─────────────────────────────────────────────────────────────
   Future<bool> requestAllPermissions() async {
     final permissions = <Permission>[
@@ -332,24 +323,19 @@ class AppState extends ChangeNotifier {
     _lastLatencyMs = null;
     _latencySumMs = 0;
     _burstCount = 0;
-    _feedChain = Future.value();
     _isActive = true;
     notifyListeners();
     _listenToStreams();
     await audioPlayer.init();
   }
 
-  Future<void> _onWavInfo(int sampleRate, int numChannels, int bitsPerSample) async {
-    try {
-      await audioPlayer.startStreaming(
-        sampleRate: sampleRate, numChannels: numChannels, bitsPerSample: bitsPerSample,
-      );
-      _log.i('Motor de audio: ${sampleRate}Hz ${numChannels}ch ${bitsPerSample}bit');
-    } catch (e) {
-      _log.e('Error iniciando motor de audio: $e');
-      _statusMessage = 'Error iniciando audio: $e';
-      notifyListeners();
-    }
+  /// Solo fija el formato — ya no arranca ningún reproductor persistente
+  /// (ver AudioPlayerService: se reproduce por clips discretos encolados,
+  /// no streaming en tiempo real), así que no hay nada que pueda fallar
+  /// aquí ni ningún estado que reiniciar.
+  void _onWavInfo(int sampleRate, int numChannels, int bitsPerSample) {
+    audioPlayer.configure(sampleRate: sampleRate, numChannels: numChannels);
+    _log.i('Formato de audio: ${sampleRate}Hz ${numChannels}ch');
   }
 
   void _listenToStreams() {
@@ -367,7 +353,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     _audioChunkSub = btManager.audioChunkStream.listen((chunk) {
-      _feedChain = _feedChain.then((_) => audioPlayer.feedChunk(chunk));
+      audioPlayer.enqueueChunk(chunk);
     });
     _statusSub = btManager.statusStream.listen((msg) {
       _statusMessage = msg;

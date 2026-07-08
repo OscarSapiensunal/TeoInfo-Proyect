@@ -71,15 +71,15 @@ class BluetoothManager {
   Future<void> _sendChain = Future.value();
 
   // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
-  int _rxSampleRate = kMicSampleRate;
   int _rxNumChannels = kMicNumChannels;
   int _rxBitsPerSample = kMicBitsPerSample;
-  Future<void> Function(int sr, int nc, int bps)? _onWavInfoCallback;
+  void Function(int sr, int nc, int bps)? _onWavInfoCallback;
 
-  /// Drena el Jitter Buffer a ritmo constante (independiente de la llegada
-  /// a ráfagas de los paquetes BT) para que la reproducción sea uniforme y
-  /// el indicador de llenado del buffer refleje el estado real.
-  Timer? _playbackTimer;
+  /// Agrupa el Jitter Buffer en clips de ~500 ms para reproducirse como
+  /// archivos discretos (ver README/AudioPlayerService: se abandonó el
+  /// streaming en tiempo real por un bug nativo confirmado de flutter_sound).
+  Timer? _playbackBatchTimer;
+  static const int kPlaybackBatchMs = 500;
 
   // ── Estado de ráfaga entrante en curso ────────────────────────────────────
   int? _rxBurstId;
@@ -179,8 +179,7 @@ class BluetoothManager {
   /// está activa — así el anfitrión también escucha lo que el participante
   /// le hable de vuelta.
   Future<void> startAsHost({
-    required Future<void> Function(
-            int sampleRate, int numChannels, int bitsPerSample)
+    required void Function(int sampleRate, int numChannels, int bitsPerSample)
         onWavInfo,
     bool micEnabled = true,
     String? wavFilePath,
@@ -204,15 +203,11 @@ class BluetoothManager {
                 'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
             _statusController.add('Conectado: ${event.deviceName}');
             try {
-              // NO se arranca la reproducción "a ciegas" con el formato del
-              // micrófono por defecto aquí: eso causaba un doble arranque del
-              // reproductor (uno con el formato por defecto, otro al llegar
-              // el meta-paquete real en modo WAV) que corrompía el estado
-              // interno de flutter_sound y dejaba la reproducción muda el
-              // resto de la sesión (confirmado con logcat en hardware real).
-              // La reproducción arranca UNA sola vez, disparada por el
-              // meta-paquete que el otro lado envía al empezar a transmitir
-              // (ver _handleIncomingPacket).
+              // La reproducción (ver _beginPlayback) se configura cuando
+              // llega el meta-paquete que el otro lado envía al empezar a
+              // transmitir (ver _handleIncomingPacket) — no hay estado
+              // persistente que "arrancar" dos veces, así que no hay riesgo
+              // de reinicios concurrentes del reproductor.
               if (wavFilePath != null && wavHeader != null) {
                 await _sendStreamInfoPacket(
                   sampleRate: wavHeader.sampleRate,
@@ -271,8 +266,7 @@ class BluetoothManager {
   Future<void> joinAsClient({
     required String address,
     required String name,
-    required Future<void> Function(
-            int sampleRate, int numChannels, int bitsPerSample)
+    required void Function(int sampleRate, int numChannels, int bitsPerSample)
         onWavInfo,
     bool micEnabled = true,
   }) async {
@@ -587,7 +581,7 @@ class BluetoothManager {
       final view = ByteData.sublistView(packet);
       final sr = view.getUint32(4, Endian.little);
       _log.i('Meta-paquete audio: ${sr}Hz, ${nc}ch, ${bps}bit');
-      unawaited(_beginPlayback(sr, nc, bps));
+      _beginPlayback(sr, nc, bps);
       return;
     }
 
@@ -724,58 +718,44 @@ class BluetoothManager {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // REPRODUCCIÓN — DRENADO DEL JITTER BUFFER A RITMO CONSTANTE
+  // REPRODUCCIÓN — AGRUPAR EL JITTER BUFFER EN CLIPS DISCRETOS
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Fija el formato de audio entrante, ESPERA a que el motor de reproducción
-  /// termine de arrancar de verdad, y arranca el drenado periódico del buffer.
-  ///
-  /// CRÍTICO: hay que esperar (no disparar en fire-and-forget) antes de que
-  /// el llamador arranque el micrófono. En hardware real (visto en un
-  /// Motorola/MediaTek) arrancar el AudioTrack de reproducción y el
-  /// AudioRecord de captura casi al mismo instante desestabiliza el HAL de
-  /// audio nativo y produce un SIGSEGV dentro de `AudioTrack::write` — un
-  /// crash de proceso completo, no una excepción de Dart. El pequeño margen
-  /// tras confirmar el arranque del reproductor evita esa carrera.
-  Future<void> _beginPlayback(
-      int sampleRate, int numChannels, int bitsPerSample) async {
-    _rxSampleRate = sampleRate;
+  /// Fija el formato de audio entrante y asegura que el temporizador de
+  /// agrupado esté corriendo. Operación puramente local y síncrona — no hay
+  /// ningún estado de reproductor nativo persistente que reiniciar, así que
+  /// no existe el riesgo de arranques concurrentes que teníamos con el
+  /// streaming en tiempo real (ver AudioPlayerService).
+  void _beginPlayback(int sampleRate, int numChannels, int bitsPerSample) {
     _rxNumChannels = numChannels;
     _rxBitsPerSample = bitsPerSample;
-    try {
-      await _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
-    } catch (e, st) {
-      _log.e('Error arrancando el motor de audio: $e', error: e, stackTrace: st);
-      _statusController.add('Error de audio: $e');
-    }
-    await Future.delayed(const Duration(milliseconds: 300));
-    _startPlaybackDrain();
+    _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
+    _startPlaybackBatching();
   }
 
-  /// Duración en ms del audio contenido en un bloque de [kPayloadSize] bytes,
-  /// según el formato (sampleRate/canales/bits) actualmente conocido.
-  double _computeBlockDurationMs() {
-    final int bytesPerFrame = _rxNumChannels * (_rxBitsPerSample ~/ 8);
-    if (bytesPerFrame <= 0 || _rxSampleRate <= 0) return 32.0;
-    final double frames = kPayloadSize / bytesPerFrame;
-    return frames / _rxSampleRate * 1000.0;
-  }
-
-  /// Arranca (o reinicia, si cambia el formato) el timer que extrae bloques
-  /// del Jitter Buffer al ritmo real de reproducción. Esto desacopla la
-  /// llegada a ráfagas de los paquetes BT del consumo del audio, que es lo
-  /// que hace que `bufferFillRatio` refleje el estado real del buffer en
-  /// lugar de vaciarse instantáneamente en cada paquete recibido.
-  void _startPlaybackDrain() {
-    _playbackTimer?.cancel();
-    final double ms = _computeBlockDurationMs().clamp(5.0, 100.0);
-    _playbackTimer = Timer.periodic(
-      Duration(microseconds: (ms * 1000).round()),
-      (_) {
-        final block = _dsp.jitterBuffer.pop();
-        _audioChunkController.add(block ?? Uint8List(kPayloadSize));
-      },
+  /// Arranca (si no estaba corriendo) el timer que cada [kPlaybackBatchMs]
+  /// ms extrae TODO lo acumulado en el Jitter Buffer y lo emite como un solo
+  /// clip para reproducirse con `AudioPlayerService.enqueueChunk()`. El
+  /// Jitter Buffer sigue absorbiendo la llegada a ráfagas de los paquetes
+  /// BT; este timer solo decide cada cuánto se corta esa cola en clips
+  /// reproducibles.
+  void _startPlaybackBatching() {
+    if (_playbackBatchTimer != null) return;
+    _playbackBatchTimer = Timer.periodic(
+      const Duration(milliseconds: kPlaybackBatchMs),
+      (_) => _drainToPlaybackQueue(),
     );
+  }
+
+  void _drainToPlaybackQueue() {
+    if (_dsp.jitterBuffer.isEmpty) return;
+    final builder = BytesBuilder(copy: false);
+    Uint8List? block;
+    while ((block = _dsp.jitterBuffer.pop()) != null) {
+      builder.add(block!);
+    }
+    if (builder.isEmpty) return;
+    _audioChunkController.add(builder.toBytes());
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -827,8 +807,8 @@ class BluetoothManager {
     _serverTxActive = false;
     _rssiTimer?.cancel();
     _rssiTimer = null;
-    _playbackTimer?.cancel();
-    _playbackTimer = null;
+    _playbackBatchTimer?.cancel();
+    _playbackBatchTimer = null;
     _resetRxState();
     _resetTxState();
 

@@ -131,18 +131,31 @@ Socket RFCOMM
          │
          ▼
 ┌─────────────────────┐
-│   Jitter Buffer     │  Circular, 16 slots × 1020 bytes
+│   Jitter Buffer     │  Circular, 80 slots × 1020 bytes (≈ 1 ráfaga completa)
 │   (circular)        │  Política: drop-oldest si lleno
 └────────┬────────────┘
-         │  Timer periódico (BluetoothManager._startPlaybackDrain), NO cada
-         │  paquete: desacopla la llegada a ráfagas del BT del ritmo real
-         │  de reproducción, para que fillRatio refleje el estado real.
+         │  Cada 500 ms se agrupa TODO lo acumulado en un clip
+         │  (BluetoothManager._drainToPlaybackQueue)
          ▼
 ┌─────────────────────┐
-│  flutter_sound      │  feedFromStream() → PCM directo a DAC
-│  PCM Stream         │
+│  flutter_sound      │  AudioPlayerService: clips discretos encolados vía
+│  startPlayer()      │  startPlayer(fromDataBuffer:), NO streaming en
+│  (fromDataBuffer)   │  tiempo real — ver nota abajo.
 └─────────────────────┘
 ```
+
+**Por qué NO streaming en tiempo real:** la primera versión usaba
+`startPlayerFromStream()` + `feedFromStream()` (feed bloque a bloque, ~32 ms).
+Se abandonó tras confirmar con `adb logcat` en tres teléfonos (dos chipsets,
+dos versiones de Android) un crash nativo reproducible — SIGSEGV/SIGABRT
+dentro de `AudioTrack::write`/`releaseBuffer`, el mismo patrón sin resolver
+reportado en [flutter_sound#508](https://github.com/Canardoux/flutter_sound/issues/508).
+Ajustar el tamaño del buffer nativo no lo eliminó. La solución fue cambiar de
+mecanismo: agrupar el audio recibido en clips de ~500 ms y reproducirlos con
+`startPlayer(fromDataBuffer:)`, la API "de archivo" madura y ampliamente
+usada del plugin, evitando por completo el código de streaming donde vive
+el bug — a costa de ~0.5-1 s de latencia adicional, aceptable dado que la
+arquitectura ya tiene ~2 s de latencia inherente por las ráfagas de 2 s.
 
 ---
 
