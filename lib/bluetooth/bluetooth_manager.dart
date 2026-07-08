@@ -75,11 +75,21 @@ class BluetoothManager {
   int _rxBitsPerSample = kMicBitsPerSample;
   void Function(int sr, int nc, int bps)? _onWavInfoCallback;
 
-  /// Agrupa el Jitter Buffer en clips de ~500 ms para reproducirse como
-  /// archivos discretos (ver README/AudioPlayerService: se abandonó el
-  /// streaming en tiempo real por un bug nativo confirmado de flutter_sound).
+  /// Agrupa el Jitter Buffer en clips discretos para reproducción (ver
+  /// README/AudioPlayerService: se abandonó el streaming en tiempo real por
+  /// un bug nativo confirmado de flutter_sound). El timer es solo la cadencia
+  /// de CHEQUEO — el tamaño del clip lo decide _drainToPlaybackQueue:
+  /// espera a acumular una ráfaga completa (~2 s) antes de emitir, para que
+  /// la pausa de arranque entre clips ocurra solo en el límite natural entre
+  /// ráfagas y no cada medio segundo (probado en campo: clips de 500 ms
+  /// suenan entrecortados porque cada startPlayer() añade ~100-300 ms de
+  /// silencio entre clips).
   Timer? _playbackBatchTimer;
-  static const int kPlaybackBatchMs = 500;
+  static const int kPlaybackBatchTickMs = 250;
+
+  /// Tamaño del último tick del Jitter Buffer, para detectar que dejó de
+  /// crecer (fin de la ráfaga en tránsito) y vaciar la cola restante.
+  int _lastJitterSize = 0;
 
   // ── Estado de ráfaga entrante en curso ────────────────────────────────────
   int? _rxBurstId;
@@ -733,27 +743,42 @@ class BluetoothManager {
     _startPlaybackBatching();
   }
 
-  /// Arranca (si no estaba corriendo) el timer que cada [kPlaybackBatchMs]
-  /// ms extrae TODO lo acumulado en el Jitter Buffer y lo emite como un solo
-  /// clip para reproducirse con `AudioPlayerService.enqueueChunk()`. El
-  /// Jitter Buffer sigue absorbiendo la llegada a ráfagas de los paquetes
-  /// BT; este timer solo decide cada cuánto se corta esa cola en clips
-  /// reproducibles.
+  /// Arranca (si no estaba corriendo) el timer de chequeo del agrupado.
   void _startPlaybackBatching() {
     if (_playbackBatchTimer != null) return;
+    _lastJitterSize = 0;
     _playbackBatchTimer = Timer.periodic(
-      const Duration(milliseconds: kPlaybackBatchMs),
+      const Duration(milliseconds: kPlaybackBatchTickMs),
       (_) => _drainToPlaybackQueue(),
     );
   }
 
+  /// Bloques que debe acumular el Jitter Buffer antes de emitir un clip:
+  /// una ráfaga completa (2 s de voz ≈ 62 bloques de 1020 B).
+  static final int _minClipBlocks = kBurstPcmBytes ~/ kPayloadSize;
+
+  /// Emite un clip solo cuando hay una ráfaga completa acumulada, O cuando
+  /// el buffer dejó de crecer entre ticks (llegó el final de la transmisión
+  /// o una ráfaga incompleta por pérdidas) — así el clip típico dura ~2 s y
+  /// la pausa de arranque entre clips cae en el límite natural entre
+  /// ráfagas, en vez de trocear la voz cada 500 ms.
   void _drainToPlaybackQueue() {
-    if (_dsp.jitterBuffer.isEmpty) return;
+    final int size = _dsp.jitterBuffer.size;
+    if (size == 0) {
+      _lastJitterSize = 0;
+      return;
+    }
+    final bool fullClip = size >= _minClipBlocks;
+    final bool stalled = size == _lastJitterSize;
+    _lastJitterSize = size;
+    if (!fullClip && !stalled) return; // seguir acumulando
+
     final builder = BytesBuilder(copy: false);
     Uint8List? block;
     while ((block = _dsp.jitterBuffer.pop()) != null) {
       builder.add(block!);
     }
+    _lastJitterSize = 0;
     if (builder.isEmpty) return;
     _audioChunkController.add(builder.toBytes());
   }
@@ -809,6 +834,7 @@ class BluetoothManager {
     _rssiTimer = null;
     _playbackBatchTimer?.cancel();
     _playbackBatchTimer = null;
+    _lastJitterSize = 0;
     _resetRxState();
     _resetTxState();
 

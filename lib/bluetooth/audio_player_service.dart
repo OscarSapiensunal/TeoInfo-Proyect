@@ -40,6 +40,14 @@ class AudioPlayerService {
 
   final Queue<Uint8List> _queue = Queue<Uint8List>();
 
+  /// Tope de la cola de clips pendientes. Cada startPlayer() añade una
+  /// pequeña pausa entre clips, así que la reproducción es ligeramente más
+  /// lenta que la llegada de audio — sin tope, la cola crecería sin límite
+  /// en sesiones largas (memoria) y la voz quedaría cada vez más retrasada.
+  /// Con drop-oldest, en el peor caso se pierde el clip más viejo y la
+  /// conversación se mantiene cerca del presente.
+  static const int kMaxQueuedClips = 4;
+
   // ─────────────────────────────────────────────────────────────────────────
   // INICIALIZACIÓN
   // ─────────────────────────────────────────────────────────────────────────
@@ -66,6 +74,11 @@ class AudioPlayerService {
   void enqueueChunk(Uint8List chunk) {
     if (chunk.isEmpty) return;
     _queue.add(chunk);
+    while (_queue.length > kMaxQueuedClips) {
+      _queue.removeFirst();
+      _log.w('Cola de reproducción llena: se descarta el clip más antiguo '
+          'para mantener la conversación cerca del presente');
+    }
     if (!_isPlayingClip) {
       unawaited(_playNext());
     }
