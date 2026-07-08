@@ -117,11 +117,9 @@ class MainActivity : FlutterActivity() {
                                 ?: throw IllegalStateException("Sin cliente conectado")
                             out.write(bytes)
                             out.flush()
-                            mainHandler.post { result.success(null) }
+                            postSafely { result.success(null) }
                         } catch (e: Exception) {
-                            mainHandler.post {
-                                result.error("WRITE_ERROR", e.message, null)
-                            }
+                            postSafely { result.error("WRITE_ERROR", e.message, null) }
                         }
                     }
                 }
@@ -152,8 +150,26 @@ class MainActivity : FlutterActivity() {
     // SERVIDOR RFCOMM / SPP
     // ──────────────────────────────────────────────────────────────────────
 
+    /// Ejecuta [block] en el hilo principal con try/catch propio.
+    ///
+    /// CRÍTICO: el try/catch de la función que llama a mainHandler.post()
+    /// NO protege el contenido del bloque posteado — ese código corre más
+    /// tarde, ya fuera de esa pila de llamadas. Una excepción sin capturar
+    /// aquí (p. ej. un EventSink/Result en estado inválido) tumba el proceso
+    /// completo de Android sin que ninguna protección del lado Dart
+    /// (runZonedGuarded, FlutterError.onError) pueda hacer nada al respecto.
+    private fun postSafely(block: () -> Unit) {
+        mainHandler.post {
+            try {
+                block()
+            } catch (e: Exception) {
+                Log.e(TAG, "Excepción no capturada en callback de hilo principal: ${e.message}", e)
+            }
+        }
+    }
+
     private fun emitServerEvent(event: Map<String, Any?>) {
-        mainHandler.post { serverEventSink?.success(event) }
+        postSafely { serverEventSink?.success(event) }
     }
 
     private fun startSppServer() {
@@ -253,9 +269,7 @@ class MainActivity : FlutterActivity() {
 
             override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
                 latestRssi.set(rssi)
-                mainHandler.post {
-                    result.success(rssi.toDouble())
-                }
+                postSafely { result.success(rssi.toDouble()) }
                 gatt.disconnect()
                 gatt.close()
             }

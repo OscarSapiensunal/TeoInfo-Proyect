@@ -225,14 +225,22 @@ idéntica en cada corrida.
   Fallback: variación aleatoria de ±0.5 dBm para demostración.
 - **flutter_bluetooth_serial**: la versión ^0.4.0 requiere `minSdkVersion 19`.
   Asegúrate de configurarlo en `android/app/build.gradle`.
-- **Robustez frente a cierres inesperados**: dos streams internos (eventos del
-  servidor SPP nativo y captura de micrófono) no tenían manejador `onError` —
-  un fallo nativo ahí se propagaba como excepción no capturada. Se agregaron
-  `onError` a ambos, más `runZonedGuarded` + `FlutterError.onError` +
-  `PlatformDispatcher.instance.onError` en `main.dart` como red de seguridad
-  global. `AudioCaptureService` también fuerza reabrir el recorder nativo desde
-  cero si un intento de arranque falla, en vez de reintentar sobre una
-  instancia potencialmente corrupta.
+- **Robustez frente a cierres inesperados (lado Dart)**: dos streams internos
+  (eventos del servidor SPP nativo y captura de micrófono) no tenían manejador
+  `onError`. Se agregó `onError` a ambos, más `runZonedGuarded` +
+  `FlutterError.onError` + `PlatformDispatcher.instance.onError` en
+  `main.dart` como red de seguridad global. `AudioCaptureService` también
+  fuerza reabrir el recorder nativo desde cero si un intento de arranque
+  falla, en vez de reintentar sobre una instancia potencialmente corrupta.
+- **Robustez frente a cierres inesperados (lado nativo, `MainActivity.kt`)**:
+  bug más serio — todas las llamadas `mainHandler.post { ... }` (que reenvían
+  eventos del servidor SPP al hilo principal) corrían SIN try/catch propio.
+  El try/catch de la función que llama a `post()` no protege el contenido
+  del bloque posteado (ese código se ejecuta después, ya fuera de esa pila de
+  llamadas) — una excepción ahí (p. ej. un `EventSink`/`Result` en estado
+  inválido) tumbaba el proceso Android completo, sin que ninguna protección
+  del lado Dart pudiera evitarlo. Se envolvió cada `post{}` con `postSafely()`,
+  que atrapa y registra cualquier excepción en el hilo principal.
 - **Micrófono silenciable en vivo**: `BluetoothManager.setMicEnabled()` detiene
   o arranca la captura real (no solo deja de enviar), así que el indicador de
   micrófono del sistema operativo refleja el estado real — se puede silenciar
