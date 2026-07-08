@@ -16,6 +16,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../dsp/information_theory.dart';
 import '../models/app_models.dart';
 import '../utils/app_state.dart';
 
@@ -65,7 +66,11 @@ class UiDashboard extends StatelessWidget {
               SizedBox(height: 12),
               _MetricsPanelCard(),
               SizedBox(height: 12),
+              _InfoTheoryCard(),
+              SizedBox(height: 12),
               _RealtimeChartCard(),
+              SizedBox(height: 12),
+              _AlgorithmLogCard(),
               SizedBox(height: 16),
               _StopSessionButton(),
               SizedBox(height: 24),
@@ -591,6 +596,31 @@ class _MetricsPanelCard extends StatelessWidget {
       icon: Icons.analytics_rounded,
       child: Column(
         children: [
+          Align(
+            alignment: Alignment.centerRight,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: (m.rssiIsReal ? _C.accentGreen : _C.accentAmber)
+                    .withOpacity(0.12),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: (m.rssiIsReal ? _C.accentGreen : _C.accentAmber)
+                      .withOpacity(0.4),
+                ),
+              ),
+              child: Text(
+                m.rssiIsReal ? 'RSSI real (BT)' : 'RSSI simulado',
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  color: m.rssiIsReal ? _C.accentGreen : _C.accentAmber,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           Row(
             children: [
               _MetricTile(
@@ -662,6 +692,121 @@ class _MetricsPanelCard extends StatelessWidget {
     if (loss < 2)  return _C.accentGreen;
     if (loss < 10) return _C.accentAmber;
     return _C.accentRed;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEORÍA DE LA INFORMACIÓN — Capacidad de Shannon del canal (C = B·log2(1+SNR),
+// con el RSSI actual como proxy de SNR) y entropía de la fuente H(X) medida
+// sobre el último clip reproducido.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _InfoTheoryCard extends StatelessWidget {
+  const _InfoTheoryCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.isActive) return const SizedBox.shrink();
+
+    final info = state.infoTheory;
+
+    return _Card(
+      title: 'TEORÍA DE LA INFORMACIÓN',
+      icon: Icons.insights_rounded,
+      child: info == null
+          ? const Text(
+              'Esperando el primer clip reproducido…',
+              style: TextStyle(color: _C.textMuted, fontSize: 12),
+            )
+          : Column(
+              children: [
+                Row(
+                  children: [
+                    _MetricTile(
+                      label: 'CAPACIDAD C',
+                      value:
+                          '${(info.channelCapacityBps / 1000).toStringAsFixed(1)} kbps',
+                      icon: Icons.swap_vert_rounded,
+                      color: _C.accent,
+                    ),
+                    const SizedBox(width: 10),
+                    _MetricTile(
+                      label: 'ENTROPÍA H(X)',
+                      value:
+                          '${info.sourceEntropyBitsPerSample.toStringAsFixed(2)} bits',
+                      icon: Icons.scatter_plot_rounded,
+                      color: _C.accentGreen,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'C = B·log2(1+SNR) con B = Nyquist del muestreo y SNR relativo al '
+                  'piso de ruido asumido (${InformationTheory.kAssumedNoiseFloorDbm.toStringAsFixed(0)} dBm). '
+                  'H(X) máxima con 256 bins: ${info.maxEntropyBitsPerSample.toStringAsFixed(0)} bits/muestra '
+                  '(ruido blanco uniforme); la voz real siempre da menos.',
+                  style: const TextStyle(color: _C.textMuted, fontSize: 10),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOG DE ACTIVIDAD DE ALGORITMOS — traza en vivo de qué algoritmo actuó y
+// cuándo (PLC, AEC/semi-dúplex, AWGN+filtro IIR/FIR). Responde al pedido de
+// "ver logs y un algoritmo funcionando" que surgió en sustentaciones previas.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _AlgorithmLogCard extends StatelessWidget {
+  const _AlgorithmLogCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.isActive) return const SizedBox.shrink();
+
+    final log = state.algorithmLog;
+
+    return _Card(
+      title: 'LOG DE ALGORITMOS EN VIVO',
+      icon: Icons.terminal_rounded,
+      child: Container(
+        width: double.infinity,
+        height: 160,
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: _C.bg,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: _C.border),
+        ),
+        child: log.isEmpty
+            ? const Center(
+                child: Text(
+                  'Sin eventos aún… habla o reproduce el .wav para ver PLC, '
+                  'AEC y AWGN/filtros actuar en vivo.',
+                  style: TextStyle(color: _C.textMuted, fontSize: 11),
+                  textAlign: TextAlign.center,
+                ),
+              )
+            : ListView.builder(
+                itemCount: log.length,
+                itemBuilder: (_, i) => Padding(
+                  padding: const EdgeInsets.only(bottom: 3),
+                  child: Text(
+                    log[i],
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: _C.textPrimary,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ),
+      ),
+    );
   }
 }
 

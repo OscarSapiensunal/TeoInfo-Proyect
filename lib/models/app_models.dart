@@ -217,6 +217,13 @@ class ChannelMetrics {
   /// Rango típico: -100 dBm (muy débil) a -40 dBm (muy fuerte).
   final double rssiDbm;
 
+  /// true si [rssiDbm] viene de una lectura real del hardware (GATT sobre
+  /// el enlace clásico); false si es una simulación de respaldo porque el
+  /// dispositivo remoto no soportó la lectura real (frecuente en BT
+  /// Clásico — no todos los chips exponen RSSI así). Se muestra en la UI
+  /// para no hacer pasar un valor simulado por uno medido.
+  final bool rssiIsReal;
+
   /// Tasa de pérdida de paquetes en porcentaje [0.0 – 100.0].
   final double packetLossPercent;
 
@@ -234,6 +241,7 @@ class ChannelMetrics {
 
   const ChannelMetrics({
     required this.rssiDbm,
+    this.rssiIsReal = false,
     required this.packetLossPercent,
     required this.bufferFillRatio,
     required this.packetsReceived,
@@ -243,6 +251,7 @@ class ChannelMetrics {
 
   ChannelMetrics copyWith({
     double? rssiDbm,
+    bool? rssiIsReal,
     double? packetLossPercent,
     double? bufferFillRatio,
     int? packetsReceived,
@@ -251,6 +260,7 @@ class ChannelMetrics {
   }) {
     return ChannelMetrics(
       rssiDbm: rssiDbm ?? this.rssiDbm,
+      rssiIsReal: rssiIsReal ?? this.rssiIsReal,
       packetLossPercent: packetLossPercent ?? this.packetLossPercent,
       bufferFillRatio: bufferFillRatio ?? this.bufferFillRatio,
       packetsReceived: packetsReceived ?? this.packetsReceived,
@@ -268,6 +278,33 @@ class ChannelMetrics {
         packetsLost: 0,
         timestamp: DateTime.now(),
       );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MÉTRICAS DE TEORÍA DE LA INFORMACIÓN (Capítulo IV)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class InfoTheoryMetrics {
+  /// Capacidad de canal de Shannon-Hartley estimada (bits/s), a partir del
+  /// RSSI actual como proxy de SNR (ver InformationTheory.shannonCapacityBps).
+  final double channelCapacityBps;
+
+  /// Entropía de Shannon H(X) del último clip de audio recibido, en
+  /// bits/muestra (ver InformationTheory.sourceEntropyBitsPerSample).
+  final double sourceEntropyBitsPerSample;
+
+  /// Entropía máxima posible con la misma cuantización (fuente
+  /// equiprobable) — referencia para comparar contra [sourceEntropyBitsPerSample].
+  final double maxEntropyBitsPerSample;
+
+  final DateTime timestamp;
+
+  const InfoTheoryMetrics({
+    required this.channelCapacityBps,
+    required this.sourceEntropyBitsPerSample,
+    required this.maxEntropyBitsPerSample,
+    required this.timestamp,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

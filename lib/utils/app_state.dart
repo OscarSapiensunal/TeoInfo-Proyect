@@ -79,6 +79,14 @@ class AppState extends ChangeNotifier {
   ChannelMetrics _metrics = ChannelMetrics.zero();
   ChannelMetrics get metrics => _metrics;
 
+  // ── Teoría de la Información (capacidad de Shannon, entropía) ────────────
+  InfoTheoryMetrics? _infoTheory;
+  InfoTheoryMetrics? get infoTheory => _infoTheory;
+
+  // ── Log de actividad de algoritmos DSP (PLC, AWGN, filtro, entropía) ────
+  final List<String> _algorithmLog = [];
+  List<String> get algorithmLog => List.unmodifiable(_algorithmLog);
+
   // ── Latencias por ráfaga (insumos para el informe) ───────────────────────
   double? _lastLatencyMs;
   double _latencySumMs = 0;
@@ -97,10 +105,12 @@ class AppState extends ChangeNotifier {
   DateTime? _sessionStart;
   static const int kMaxChartPoints = 60;
 
-  StreamSubscription<ChannelMetrics>? _metricsSub;
-  StreamSubscription<Uint8List>?      _audioChunkSub;
-  StreamSubscription<String>?         _statusSub;
-  StreamSubscription<LatencyMetric>?  _latencySub;
+  StreamSubscription<ChannelMetrics>?    _metricsSub;
+  StreamSubscription<Uint8List>?         _audioChunkSub;
+  StreamSubscription<String>?            _statusSub;
+  StreamSubscription<LatencyMetric>?     _latencySub;
+  StreamSubscription<InfoTheoryMetrics>? _infoTheorySub;
+  StreamSubscription<String>?            _algorithmLogSub;
 
   // ── Permisos ─────────────────────────────────────────────────────────────
   Future<bool> requestAllPermissions() async {
@@ -323,9 +333,12 @@ class AppState extends ChangeNotifier {
     _lastLatencyMs = null;
     _latencySumMs = 0;
     _burstCount = 0;
+    _algorithmLog.clear();
+    _infoTheory = null;
     _isActive = true;
     notifyListeners();
     _listenToStreams();
+    btManager.isSpeakerActive = () => audioPlayer.isPlaying;
     await audioPlayer.init();
   }
 
@@ -361,6 +374,20 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     _latencySub = btManager.latencyStream.listen(_onLatencyMetric);
+    _infoTheorySub = btManager.infoTheoryStream.listen((m) {
+      _infoTheory = m;
+      notifyListeners();
+    });
+    _algorithmLogSub = btManager.algorithmLogStream.listen((msg) {
+      final t = DateTime.now();
+      final hh = t.hour.toString().padLeft(2, '0');
+      final mm = t.minute.toString().padLeft(2, '0');
+      final ss = t.second.toString().padLeft(2, '0');
+      _algorithmLog.insert(0, '[$hh:$mm:$ss] $msg');
+      if (_algorithmLog.length > kMaxLogLines) _algorithmLog.removeLast();
+      _log.i(msg);
+      notifyListeners();
+    });
   }
 
   void _onLatencyMetric(LatencyMetric m) {
@@ -389,8 +416,11 @@ class AppState extends ChangeNotifier {
     await _audioChunkSub?.cancel();
     await _statusSub?.cancel();
     await _latencySub?.cancel();
+    await _infoTheorySub?.cancel();
+    await _algorithmLogSub?.cancel();
     _metricsSub = null; _audioChunkSub = null;
     _statusSub = null;  _latencySub = null;
+    _infoTheorySub = null; _algorithmLogSub = null;
     await btManager.disconnect();
     await audioPlayer.stopStreaming();
     _statusMessage = 'Sesión finalizada';

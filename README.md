@@ -69,6 +69,9 @@ Conceptos del curso directamente aplicados:
 | **Transformada de Fourier / respuesta en frecuencia** (Cap. II 2.5–2.11) | El diseño y análisis del filtro (frecuencia de corte, atenuación) se hace en el dominio de la frecuencia con `scipy.signal.freqz` (DFT computacional, Cap. II 2.11). |
 | **Ruido AWGN** (Cap. IV) | Cuando el RSSI cae bajo −75 dBm, el receptor inyecta ruido blanco gaussiano (método Box-Muller, implementado a mano) proporcional a la degradación, para hacer audible/medible el efecto del canal sobre la señal. |
 | **Medidas del canal físico** | RSSI en dBm (potencia recibida), tasa de pérdida (calidad del canal de datos), latencia por RTT (el emisor mide con su propio reloj, evitando el problema de relojes no sincronizados entre teléfonos). |
+| **Filtro adaptativo — cancelación de eco acústico** (Cap. II, filtro con coeficientes variables en el tiempo) | NLMS (Normalized LMS) de 128 taps que estima, muestra a muestra, el eco acústico parlante→micrófono propio y lo resta antes de transmitir (`echo_canceller.dart`); usa la misma ecuación en diferencias que un FIR, pero con `w[k]` adaptándose con `w[k] += (μ·e[n]/‖x‖²)·x[n−k]`. La mitigación PRINCIPAL y garantizada es semi-dúplex (silenciar el micrófono propio mientras el parlante reproduce); el NLMS ataca el eco residual, no reemplaza al semi-dúplex. |
+| **Capacidad de canal de Shannon-Hartley** (Cap. IV) | `C = B·log2(1+SNR)` calculada en vivo: `B` = ancho de banda de Nyquist del muestreo, `SNR` estimado como el RSSI actual sobre un piso de ruido asumido de −95 dBm (`information_theory.dart`). Mostrada junto al RSSI para comparar capacidad teórica contra el throughput real observado. |
+| **Entropía de la fuente** (Cap. IV 4.2) | `H(X) = −Σp(x)·log2(p(x))` estimada por histograma de 256 bins sobre cada clip de voz reproducido, contrastada contra la entropía máxima log2(256)=8 bits/muestra (ruido blanco uniforme) — la voz real siempre da menos, por sus silencios y su distribución de amplitud concentrada. |
 
 **Qué es implementación propia y qué es infraestructura de terceros** (transparencia metodológica):
 
@@ -84,6 +87,9 @@ Conceptos del curso directamente aplicados:
 | Servidor RFCOMM (listen/accept nativo Android) | **Propio** (`MainActivity.kt`, Kotlin) |
 | Parser de cabecera WAV (RIFF) | **Propio** (`app_models.dart`) |
 | Análisis de filtro Butterworth (Bode, filtfilt) | **Propio** sobre SciPy (`python_dsp/`) |
+| Cancelador de eco acústico (NLMS + semi-dúplex) | **Propio** (`echo_canceller.dart`, `bluetooth_manager.dart`) |
+| Capacidad de Shannon + entropía de la fuente | **Propio** (`information_theory.dart`) |
+| Lectura de RSSI real vía GATT sobre BT Clásico (con *fallback* simulado si el teléfono no la soporta) | **Propio** (`MainActivity.kt` + `rssi_channel.dart`) |
 | Socket Bluetooth cliente | Librería `flutter_bluetooth_serial` |
 | Acceso a micrófono y parlante (drivers de audio) | Librería `flutter_sound` |
 | UI y gráficas | Flutter + `fl_chart` |
@@ -139,12 +145,15 @@ lib/
 ├── models/
 │   └── app_models.dart                # Protocolo de paquetes, ráfagas, ACK, métricas, WavHeader
 ├── bluetooth/
-│   ├── bluetooth_manager.dart         # Pipeline RX/TX unificado (full-duplex), pérdidas, latencia
+│   ├── bluetooth_manager.dart         # Pipeline RX/TX unificado (full-duplex), pérdidas, latencia, AEC
 │   ├── rfcomm_server.dart             # Wrapper Dart del servidor SPP nativo
+│   ├── rssi_channel.dart              # MethodChannel hacia la lectura de RSSI real (GATT)
 │   ├── audio_capture_service.dart     # Micrófono → stream PCM (flutter_sound Recorder)
 │   └── audio_player_service.dart      # Reproducción por clips discretos encolados
 ├── dsp/
-│   └── dsp_processor.dart             # Jitter Buffer, PLC, AWGN, filtros IIR+FIR (todo a mano)
+│   ├── dsp_processor.dart             # Jitter Buffer, PLC, AWGN, filtros IIR+FIR (todo a mano)
+│   ├── echo_canceller.dart            # Cancelador de eco NLMS + semi-dúplex (todo a mano)
+│   └── information_theory.dart       # Capacidad de Shannon + entropía de la fuente (todo a mano)
 ├── ui/
 │   └── ui_dashboard.dart              # Conectar (esperar/buscar), mic, métricas, gráfica
 └── utils/
@@ -186,6 +195,41 @@ soporta modo cliente, por eso `MainActivity.kt` implementa `listen`+`accept()`
 en Kotlin) y el otro toca **"Buscar dispositivo"** y lo selecciona. El socket
 RFCOMM resultante es full-duplex: ambos lados ejecutan el mismo pipeline de
 envío/recepción. El micrófono de cada teléfono se silencia/activa en vivo.
+
+### Cancelación de eco acústico (AEC)
+
+Sin auriculares, el micrófono de cada teléfono capta lo que su propio
+parlante está reproduciendo — el interlocutor escucha su propia voz de
+regreso, con retardo. Se mitiga en dos capas:
+
+1. **Semi-dúplex (garantizado):** mientras el parlante propio está
+   reproduciendo un clip, la captura de micrófono se descarta por completo
+   (no se acumula ni se envía nada) — `isSpeakerActive` en
+   `bluetooth_manager.dart`, alimentado desde `AudioPlayerService.isPlaying`.
+   Esta es la mitigación que realmente garantiza que no haya un bucle de
+   realimentación acústica.
+2. **NLMS residual (best-effort):** el filtro adaptativo de
+   `echo_canceller.dart` mantiene un buffer del audio recién reproducido
+   (referencia "far-end") y estima/resta la porción que se filtró de vuelta
+   al micrófono en los bordes de la ventana semi-dúplex (colas de
+   reverberación). Es una implementación de curso, sin estimación de retardo
+   ni detección de doble-habla — no es un AEC de grado profesional, y se
+   documenta así honestamente.
+
+Cada transición de estado (silenciado/reactivado) y cada corrección del PLC
+se emiten como eventos legibles al panel **"Log de algoritmos en vivo"** de
+la UI, para poder ver — no solo inferir — qué algoritmo actuó y cuándo.
+
+### RSSI real vs. simulado
+
+El RSSI se intenta leer del hardware Bluetooth real vía una conexión GATT
+híbrida (`BluetoothGatt.readRemoteRssi`, expuesta por `MainActivity.kt` y
+consumida desde `rssi_channel.dart`). No todos los chipsets/Android exponen
+esta lectura de forma confiable sobre un enlace Bluetooth Clásico; cuando
+falla, la app recurre a una caminata aleatoria acotada (±1 dB, clamped a
+[−95, −40] dBm) como *placeholder* visual — y la UI **marca explícitamente**
+cuál de los dos modos está activo (`ChannelMetrics.rssiIsReal`), en vez de
+presentar un dato simulado como si fuera real.
 
 ### Ráfagas de voz y latencia
 
@@ -287,17 +331,27 @@ conversación, y el log de latencias (se imprime también en `adb logcat`).
 ## 8. Resultados / análisis (métricas que produce la app)
 
 En cada teléfono, sobre su propio enlace de recepción:
-- **RSSI [dBm]** — potencia de señal del canal físico (gráfica en vivo).
+- **RSSI [dBm]** — potencia de señal del canal físico (gráfica en vivo), con
+  indicador explícito de si el dato es real (GATT) o simulado (ver sección 6).
 - **Packet Loss Rate [%]** — calidad del canal de datos, medida por saltos de
   secuencia (no simulada).
 - **Jitter Buffer fill ratio [%]** — estabilidad del buffer de reproducción.
 - **Latencia por ráfaga [ms]** — tránsito estimado (receptor) y RTT medido
   (emisor); última, promedio y conteo, con log con marca de tiempo.
 - **Paquetes recibidos/perdidos** — contadores absolutos.
+- **Capacidad de canal C [kbps]** y **entropía de la fuente H(X) [bits/muestra]**
+  — recalculadas tras cada clip reproducido (panel "Teoría de la Información").
+- **Log de algoritmos en vivo** — traza con marca de tiempo de cada evento de
+  PLC (paquetes repuestos), AEC (silenciado/reactivado del micrófono) y
+  AWGN+filtro (activados cuando el RSSI cae bajo el umbral débil).
 
 Análisis esperado para el informe: correlación RSSI ↓ ⇒ pérdida ↑ al aumentar
 la distancia/obstáculos; efectividad del PLC (continuidad perceptual pese a
-pérdidas); RTT ≈ tiempo de transmisión del bloque + latencia del canal.
+pérdidas); RTT ≈ tiempo de transmisión del bloque + latencia del canal;
+contraste entre la capacidad teórica de Shannon y el throughput real de
+RFCOMM (~90 KB/s) — la brecha entre ambos es, en sí misma, una medida de
+cuánto overhead de protocolo/reintentos consume el canal real frente al
+límite teórico.
 
 ---
 
@@ -346,6 +400,15 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    ida con exactitud. Solución: protocolo de ACK — el emisor mide RTT con su
    propio reloj (metrológicamente honesto); el tránsito del receptor se
    reporta con su salvedad.
+9. **El RSSI mostrado SIEMPRE bajaba, nunca subía.** La simulación de
+   respaldo tenía un sesgo: `_currentRssi += (_currentRssi > -90 ? -0.5 : 0.5)`
+   restaba en casi cualquier valor razonable (la condición era casi siempre
+   cierta), así que el valor solo podía caer hasta el piso. Además el lado
+   que actuaba como host nunca sondeaba el RSSI real (solo lo hacía quien se
+   conectaba como cliente). Solución: caminata aleatoria acotada y simétrica
+   (±1 dB, clamped) para el modo simulado, más sondeo de RSSI real en AMBOS
+   roles (host y cliente), con un indicador en la UI de cuál de los dos modos
+   está activo en cada momento.
 
 ---
 
@@ -364,10 +427,17 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
 4. La medición de latencia por RTT demuestra la importancia de definir QUÉ se
    mide y CON QUÉ reloj: la única métrica sin sesgo de sincronización es la
    que usa un solo reloj.
-5. Mejoras futuras alineadas al curso: mostrar la capacidad de canal de
-   Shannon (C = B·log₂(1+SNR)) contra el throughput medido (Cap. IV), calcular
-   la entropía de la fuente de voz (Cap. IV 4.2), y añadir un código detector/
-   corrector simple por paquete (paridad o Hamming) para enlazar con Cap. V.
+5. La capacidad de canal de Shannon (C = B·log₂(1+SNR)) y la entropía de la
+   fuente de voz (Cap. IV 4.2) se implementaron y se muestran en vivo junto al
+   throughput medido, cerrando la brecha entre "usar el canal" y "caracterizar
+   el canal en los términos del curso".
+6. La cancelación de eco (semi-dúplex + NLMS residual) mostró que un filtro
+   FIR con coeficientes fijos no basta cuando la "respuesta al impulso" del
+   acoplamiento acústico cambia con la posición del teléfono — de ahí la
+   necesidad de un filtro ADAPTATIVO, el mismo principio de Cap. II llevado a
+   coeficientes variables en el tiempo.
+7. Mejora futura alineada al curso: añadir un código detector/corrector
+   simple por paquete (paridad o Hamming) para enlazar con Cap. V.
 
 ---
 

@@ -19,6 +19,7 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
@@ -26,8 +27,11 @@ import 'package:logger/logger.dart';
 
 import '../models/app_models.dart';
 import '../dsp/dsp_processor.dart';
+import '../dsp/echo_canceller.dart';
+import '../dsp/information_theory.dart';
 import 'audio_capture_service.dart';
 import 'rfcomm_server.dart';
+import 'rssi_channel.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTES DE PROTOCOLO
@@ -70,7 +74,18 @@ class BluetoothManager {
   int _txSeq = 0;
   Future<void> _sendChain = Future.value();
 
+  /// Cancelador de eco (ver echo_canceller.dart) aplicado a lo que SÍ se
+  /// captura tras el filtro de semi-dúplex.
+  final EchoCanceller _aec = EchoCanceller();
+
+  /// Debe devolver true mientras el parlante propio esté reproduciendo algo
+  /// (lo fija AppState apuntando a `audioPlayer.isPlaying`) — es la señal
+  /// que activa el semi-dúplex del cancelador de eco.
+  bool Function()? isSpeakerActive;
+  bool _wasGatingMic = false;
+
   // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
+  int _rxSampleRate = kMicSampleRate;
   int _rxNumChannels = kMicNumChannels;
   int _rxBitsPerSample = kMicBitsPerSample;
   void Function(int sr, int nc, int bps)? _onWavInfoCallback;
@@ -101,7 +116,9 @@ class BluetoothManager {
   int _totalPacketsReceived = 0;
   int _totalPacketsLost = 0;
   double _currentRssi = -60.0;
+  bool _rssiIsReal = false;
   Timer? _rssiTimer;
+  final math.Random _rssiRng = math.Random();
 
   // ── Buffer de reensamblado de paquetes (el socket BT puede fragmentar) ─────
   final List<int> _receiveBuffer = [];
@@ -119,6 +136,12 @@ class BluetoothManager {
   final StreamController<LatencyMetric> _latencyController =
       StreamController<LatencyMetric>.broadcast();
 
+  final StreamController<InfoTheoryMetrics> _infoTheoryController =
+      StreamController<InfoTheoryMetrics>.broadcast();
+
+  final StreamController<String> _algorithmLogController =
+      StreamController<String>.broadcast();
+
   /// Stream de métricas en tiempo real (RSSI, packet loss, buffer fill).
   Stream<ChannelMetrics> get metricsStream => _metricsController.stream;
 
@@ -130,6 +153,17 @@ class BluetoothManager {
 
   /// Stream de latencias por ráfaga (RTT de los paquetes propios enviados).
   Stream<LatencyMetric> get latencyStream => _latencyController.stream;
+
+  /// Stream de métricas de Teoría de la Información (capacidad de Shannon
+  /// del canal, entropía de la fuente) — se recalcula cada vez que se
+  /// completa un clip de audio (ver _drainToPlaybackQueue).
+  Stream<InfoTheoryMetrics> get infoTheoryStream => _infoTheoryController.stream;
+
+  /// Log textual de actividad de los algoritmos DSP en vivo (PLC, AWGN,
+  /// filtro IIR/FIR, entropía/capacidad por clip) — para verificar en la
+  /// propia UI que el procesamiento realmente se está ejecutando, no solo
+  /// contar paquetes.
+  Stream<String> get algorithmLogStream => _algorithmLogController.stream;
 
   /// Instancia DSP expuesta para acceso al Jitter Buffer desde la UI.
   DspProcessor get dsp => _dsp;
@@ -212,6 +246,11 @@ class BluetoothManager {
             _log.i(
                 'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
             _statusController.add('Conectado: ${event.deviceName}');
+            // Antes SOLO el participante (cliente) sondeaba RSSI; el
+            // anfitrión se quedaba con el valor por defecto toda la sesión.
+            if (event.deviceAddress != null) {
+              _startRssiPolling(event.deviceAddress!);
+            }
             try {
               // La reproducción (ver _beginPlayback) se configura cuando
               // llega el meta-paquete que el otro lado envía al empezar a
@@ -368,8 +407,34 @@ class BluetoothManager {
 
   /// Acumula PCM del micrófono; al completar una ráfaga de 2 s la encola
   /// para envío secuencial (la captura continúa mientras se envía).
+  ///
+  /// Cancelación de eco en dos capas:
+  ///  1. Semi-dúplex (garantizado): mientras el parlante PROPIO está
+  ///     reproduciendo algo, se descarta el audio capturado — así nunca se
+  ///     envía de vuelta lo que el propio parlante acaba de emitir. Es la
+  ///     mitigación principal contra el eco fuerte.
+  ///  2. Filtro adaptativo NLMS (ver echo_canceller.dart): sobre lo que SÍ
+  ///     se captura, resta el eco residual estimado usando como referencia
+  ///     lo que se reprodujo recientemente (colas de reverberación,
+  ///     transiciones justo al dejar de estar en semi-dúplex).
   void _onPcmChunk(Uint8List chunk) {
-    _burstBuilder.add(chunk);
+    final bool speakerActive = isSpeakerActive?.call() ?? false;
+    if (speakerActive) {
+      if (!_wasGatingMic) {
+        _algorithmLogController.add(
+            'AEC: micrófono en semi-dúplex (silenciado mientras reproduce '
+            'el parlante propio)');
+      }
+      _wasGatingMic = true;
+      return; // no se acumula ni se envía nada mientras se reproduce
+    }
+    if (_wasGatingMic) {
+      _algorithmLogController.add('AEC: micrófono reactivado');
+      _wasGatingMic = false;
+    }
+
+    final Uint8List cleaned = _aec.process(chunk);
+    _burstBuilder.add(cleaned);
     while (_burstBuilder.length >= kBurstPcmBytes) {
       final all = _burstBuilder.takeBytes();
       final burst = Uint8List.sublistView(all, 0, kBurstPcmBytes);
@@ -651,6 +716,9 @@ class BluetoothManager {
         _totalPacketsLost += lostInGap;
         _log.w('Pérdida detectada: seq esperada=$expected recibida=$seqNum '
             'perdidos=$lostInGap');
+        _algorithmLogController.add(
+            'PLC: $lostInGap paquete(s) perdido(s) → repetición atenuada '
+            '(-3 dB por repetición)');
 
         for (int i = 0; i < lostInGap; i++) {
           _dsp.processBlock(
@@ -686,6 +754,7 @@ class BluetoothManager {
 
     _metricsController.add(ChannelMetrics(
       rssiDbm: _currentRssi,
+      rssiIsReal: _rssiIsReal,
       packetLossPercent: lossPercent,
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
@@ -737,6 +806,7 @@ class BluetoothManager {
   /// no existe el riesgo de arranques concurrentes que teníamos con el
   /// streaming en tiempo real (ver AudioPlayerService).
   void _beginPlayback(int sampleRate, int numChannels, int bitsPerSample) {
+    _rxSampleRate = sampleRate;
     _rxNumChannels = numChannels;
     _rxBitsPerSample = bitsPerSample;
     _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
@@ -780,29 +850,65 @@ class BluetoothManager {
     }
     _lastJitterSize = 0;
     if (builder.isEmpty) return;
-    _audioChunkController.add(builder.toBytes());
+    final clip = builder.toBytes();
+    _audioChunkController.add(clip);
+    _aec.pushReference(clip); // referencia far-end para el cancelador de eco
+
+    // Teoría de la Información (Cap. IV): capacidad de Shannon del canal
+    // (con el RSSI actual como proxy de SNR) y entropía de la fuente medida
+    // sobre el clip que se acaba de completar.
+    final double capacityBps = InformationTheory.shannonCapacityBps(
+      rssiDbm: _currentRssi,
+      sampleRate: _rxSampleRate,
+    );
+    final double entropy = InformationTheory.sourceEntropyBitsPerSample(clip);
+    final double maxEntropy = InformationTheory.maxEntropyBitsPerSample();
+    _infoTheoryController.add(InfoTheoryMetrics(
+      channelCapacityBps: capacityBps,
+      sourceEntropyBitsPerSample: entropy,
+      maxEntropyBitsPerSample: maxEntropy,
+      timestamp: DateTime.now(),
+    ));
+
+    final bool degraded = _currentRssi < kRssiWeakThreshold;
+    _algorithmLogController.add(
+      'Clip reproducido (${(clip.length / 1024).toStringAsFixed(1)} KB): '
+      'H(X)=${entropy.toStringAsFixed(2)}/${maxEntropy.toStringAsFixed(0)} bits/muestra, '
+      'C≈${(capacityBps / 1000).toStringAsFixed(1)} kbps'
+      '${degraded ? ' · AWGN+filtro IIR/FIR activos (RSSI ${_currentRssi.toStringAsFixed(0)} < -75 dBm)' : ''}',
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────────────
   // POLLING DE RSSI
   // ──────────────────────────────────────────────────────────────────────────
 
+  /// Sondea el RSSI cada [kRssiPollIntervalMs] ms. Intenta primero una
+  /// lectura real (GATT híbrido sobre el enlace clásico, ver rssi_channel.dart);
+  /// si el dispositivo remoto no lo soporta (frecuente en BT Clásico) o no
+  /// responde a tiempo, cae a una simulación de respaldo — pero una que
+  /// realmente fluctúa arriba y abajo (paseo aleatorio acotado), no la
+  /// versión anterior que solo restaba y por eso el RSSI SIEMPRE bajaba.
   void _startRssiPolling(String address) {
+    _rssiTimer?.cancel();
     _rssiTimer = Timer.periodic(
       const Duration(milliseconds: kRssiPollIntervalMs),
       (_) async {
         try {
-          final rssi = await _getRssiNative(address);
-          _currentRssi = rssi;
+          _currentRssi = await RssiChannel.getRssi(address);
+          _rssiIsReal = true;
         } catch (_) {
-          _currentRssi += (_currentRssi > -90.0 ? -0.5 : 0.5);
+          _rssiIsReal = false;
+          // Paseo aleatorio acotado: cada tick se mueve entre -1.0 y +1.0 dBm,
+          // manteniéndose dentro de un rango físicamente razonable. A
+          // diferencia del bug anterior (que solo restaba), esto sí sube y
+          // baja, simulando fluctuación real del canal en vez de una rampa
+          // monótona hacia el piso.
+          final double step = (_rssiRng.nextDouble() * 2.0) - 1.0;
+          _currentRssi = (_currentRssi + step).clamp(-95.0, -40.0);
         }
       },
     );
-  }
-
-  Future<double> _getRssiNative(String address) async {
-    throw UnimplementedError('Canal nativo RSSI no implementado en esta plataforma');
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -825,6 +931,8 @@ class BluetoothManager {
     _txSeq = 0;
     _burstBuilder.clear();
     _sendChain = Future.value();
+    _aec.reset();
+    _wasGatingMic = false;
   }
 
   /// Detiene la transmisión/recepción y cierra la conexión.
@@ -868,6 +976,8 @@ class BluetoothManager {
     _audioChunkController.close();
     _statusController.close();
     _latencyController.close();
+    _infoTheoryController.close();
+    _algorithmLogController.close();
   }
 
   bool get isConnected =>
@@ -877,6 +987,7 @@ class BluetoothManager {
     final total = _totalPacketsReceived + _totalPacketsLost;
     return ChannelMetrics(
       rssiDbm: _currentRssi,
+      rssiIsReal: _rssiIsReal,
       packetLossPercent: total > 0 ? _totalPacketsLost / total * 100.0 : 0.0,
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
