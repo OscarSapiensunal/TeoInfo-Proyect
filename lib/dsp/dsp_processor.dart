@@ -139,16 +139,19 @@ class DspProcessor {
   // API PÚBLICA
   // ─────────────────────────────────────────────────────────────────────────
 
-  /// Procesa un bloque de bytes de audio recibido del canal BT.
+  /// Procesa un bloque de bytes de audio recibido del canal BT y lo encola
+  /// en el Jitter Buffer.
   ///
   /// Parámetros:
   /// - [rawBlock]  : bytes crudos del payload del paquete (PCM Int16 LE).
   /// - [rssiDbm]   : RSSI actual en dBm.
   /// - [isLost]    : true si este bloque fue inferido como perdido (PLC trigger).
-  /// - [numChannels] y [bitsPerSample]: parámetros del stream WAV en curso.
+  /// - [numChannels] y [bitsPerSample]: parámetros del stream de audio en curso.
   ///
-  /// Retorna los bytes procesados listos para escribir al motor de audio.
-  Uint8List processBlock({
+  /// No retorna el bloque directamente: la extracción del Jitter Buffer la
+  /// hace un consumidor periódico externo (ver `BluetoothManager._startPlaybackDrain`),
+  /// a ritmo constante e independiente de la llegada a ráfagas de los paquetes BT.
+  void processBlock({
     required Uint8List? rawBlock,
     required double rssiDbm,
     required bool isLost,
@@ -183,13 +186,8 @@ class DspProcessor {
       );
     }
 
-    // ── 4. Empujar al Jitter Buffer para reproducción suavizada ─────────────
+    // ── 4. Empujar al Jitter Buffer; el consumidor periódico externo lo drena ─
     jitterBuffer.push(workBlock);
-
-    // ── 5. Extraer del Jitter Buffer (el hilo de audio consume aquí) ─────────
-    // Se devuelve directamente para simplicidad; en producción el hilo de audio
-    // llama jitterBuffer.pop() de forma independiente.
-    return jitterBuffer.pop() ?? Uint8List(workBlock.length);
   }
 
   // ─────────────────────────────────────────────────────────────────────────

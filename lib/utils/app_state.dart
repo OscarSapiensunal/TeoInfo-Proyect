@@ -2,12 +2,18 @@
 //
 // Estado global de la aplicación (ChangeNotifier).
 //
-// Flujo P2P:
-//   · Emisor  : activar BT → hacerse visible → iniciar sesión (queda en
-//               espera como servidor SPP) → al conectar el receptor captura
-//               micrófono en ráfagas de 2 s (o transmite un WAV).
-//   · Receptor: activar BT → escanear → seleccionar/emparejar emisor →
-//               iniciar sesión (conecta como cliente y reproduce).
+// Flujo P2P bidireccional:
+//   · Anfitrión   : activar BT → hacerse visible → iniciar sesión (queda en
+//                   espera como servidor SPP).
+//   · Participante: activar BT → escanear → seleccionar/emparejar anfitrión →
+//                   iniciar sesión (conecta como cliente).
+//
+// Una vez conectados, ambos lados reciben y reproducen audio SIEMPRE; si el
+// propio micrófono está habilitado ([micEnabled]), también capturan y
+// transmiten su voz — así ambos pueden hablar y escuchar, como una radio de
+// dos vías. El modo "archivo WAV" es la excepción: unidireccional a
+// propósito (señal de prueba controlada para el informe), solo el anfitrión
+// la transmite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';
@@ -34,6 +40,13 @@ class AppState extends ChangeNotifier {
 
   AudioTxSource _txSource = AudioTxSource.microphone;
   AudioTxSource get txSource => _txSource;
+
+  /// Si está habilitado, este dispositivo captura y transmite su propio
+  /// micrófono (independiente del rol) — es lo que hace la conversación
+  /// bidireccional. Se ignora en modo archivo WAV para el participante,
+  /// que en ese modo siempre es solo oyente.
+  bool _micEnabled = true;
+  bool get micEnabled => _micEnabled;
 
   String? _wavFilePath;
   WavHeader? _wavHeader;
@@ -121,14 +134,19 @@ class AppState extends ChangeNotifier {
   void setRole(DeviceRole role) {
     _role = role;
     _statusMessage = role == DeviceRole.transmitter
-        ? 'Modo Emisor. Activa BT, hazte visible e inicia sesión.'
-        : 'Modo Receptor. Escanea y selecciona el emisor.';
+        ? 'Modo Anfitrión. Activa BT, hazte visible e inicia sesión.'
+        : 'Modo Participante. Escanea y selecciona al anfitrión.';
     notifyListeners();
     _refreshPairedDevices();
   }
 
   void setTxSource(AudioTxSource source) {
     _txSource = source;
+    notifyListeners();
+  }
+
+  void setMicEnabled(bool enabled) {
+    _micEnabled = enabled;
     notifyListeners();
   }
 
@@ -258,12 +276,27 @@ class AppState extends ChangeNotifier {
   }
 
   // ── Sesión ────────────────────────────────────────────────────────────────
+  //
+  // Ambos roles reproducen audio SIEMPRE (por eso audioPlayer.init() corre
+  // para los dos). Si _micEnabled, además capturan y transmiten su propio
+  // micrófono — así ambos lados pueden hablar y escuchar (conversación
+  // bidireccional). El modo "archivo WAV" es la excepción intencional:
+  // solo el anfitrión transmite (señal de prueba controlada para el informe).
   Future<void> startSession() async {
     if (_role == DeviceRole.receiver && _selectedDevice == null) {
-      _statusMessage = 'Selecciona el dispositivo emisor primero';
+      _statusMessage = 'Selecciona el dispositivo anfitrión primero';
       notifyListeners();
       return;
     }
+    final bool wavMode = _txSource == AudioTxSource.wavFile;
+    if (_role == DeviceRole.transmitter &&
+        wavMode &&
+        (_wavFilePath == null || _wavHeader == null)) {
+      _statusMessage = 'Selecciona un archivo .wav primero';
+      notifyListeners();
+      return;
+    }
+
     await stopScan();
     _sessionStart = DateTime.now();
     _chartHistory.clear();
@@ -274,41 +307,30 @@ class AppState extends ChangeNotifier {
     _isActive = true;
     notifyListeners();
     _listenToStreams();
-    if (_role == DeviceRole.transmitter) {
-      await _startTransmission();
-    } else {
-      await _startReception();
-    }
-  }
-
-  Future<void> _startTransmission() async {
-    if (_txSource == AudioTxSource.microphone) {
-      await btManager.startMicBurstTransmitter();
-      return;
-    }
-    if (_wavFilePath == null || _wavHeader == null) {
-      _statusMessage = 'Selecciona un archivo .wav primero';
-      notifyListeners();
-      return;
-    }
-    await btManager.startWavServerTransmitter(
-      wavFilePath: _wavFilePath!,
-      wavHeader:   _wavHeader!,
-    );
-  }
-
-  Future<void> _startReception() async {
     await audioPlayer.init();
-    await btManager.connectAndReceive(
-      address: _selectedDevice!.address,
-      name:    _selectedDevice!.name,
-      onWavInfo: (int sr, int nc, int bps) async {
-        await audioPlayer.startStreaming(
-          sampleRate: sr, numChannels: nc, bitsPerSample: bps,
-        );
-        _log.i('Motor de audio: ${sr}Hz ${nc}ch ${bps}bit');
-      },
-    );
+
+    Future<void> onWavInfo(int sr, int nc, int bps) async {
+      await audioPlayer.startStreaming(
+        sampleRate: sr, numChannels: nc, bitsPerSample: bps,
+      );
+      _log.i('Motor de audio: ${sr}Hz ${nc}ch ${bps}bit');
+    }
+
+    if (_role == DeviceRole.transmitter) {
+      await btManager.startAsHost(
+        onWavInfo: onWavInfo,
+        micEnabled: !wavMode && _micEnabled,
+        wavFilePath: wavMode ? _wavFilePath : null,
+        wavHeader: wavMode ? _wavHeader : null,
+      );
+    } else {
+      await btManager.joinAsClient(
+        address: _selectedDevice!.address,
+        name: _selectedDevice!.name,
+        onWavInfo: onWavInfo,
+        micEnabled: _micEnabled,
+      );
+    }
   }
 
   void _listenToStreams() {

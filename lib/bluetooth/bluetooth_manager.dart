@@ -1,17 +1,20 @@
 // lib/bluetooth/bluetooth_manager.dart
 //
-// Gestión de Bluetooth Clásico (RFCOMM / SPP) — arquitectura P2P.
+// Gestión de Bluetooth Clásico (RFCOMM / SPP) — conversación P2P bidireccional.
 //
-// Roles:
-//   · Emisor (Servidor SPP nativo): escucha una conexión entrante
-//     (MainActivity.kt vía RfcommSppServer), captura el micrófono en PCM
-//     lineal, segmenta en ráfagas de 2 s y las transmite con cabecera de
-//     ráfaga + paquetes numerados. Recibe ACKs del receptor y calcula la
-//     latencia de bloque (RTT) con su propio reloj.
+// El socket RFCOMM es full-duplex (como un socket TCP): lo que un lado
+// escribe llega al stream de entrada del otro sin interferir con lo que
+// éste escribe de vuelta. Por eso ambos extremos ejecutan el MISMO pipeline:
 //
-//   · Receptor (Cliente SPP): escanea/conecta al emisor, lee el stream de
-//     bytes, valida cabeceras, detecta pérdidas, estima el tiempo de
-//     tránsito de cada ráfaga, responde ACK y alimenta el DspProcessor.
+//   · Anfitrión (servidor SPP nativo — flutter_bluetooth_serial no soporta
+//     modo servidor, así que MainActivity.kt implementa listen+accept()):
+//     escucha una conexión entrante.
+//   · Participante (cliente SPP): escanea/conecta al anfitrión.
+//
+// Una vez conectados, CUALQUIERA de los dos lados que tenga el micrófono
+// habilitado captura voz en ráfagas de 2 s y las transmite; y AMBOS lados
+// reciben, detectan pérdidas, aplican DSP y reproducen lo que llegue —
+// de ahí que ambos puedan hablar y escuchar, como una radio de dos vías.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';
@@ -33,7 +36,7 @@ import 'rfcomm_server.dart';
 /// Intervalo entre paquetes en modo archivo WAV (ms).
 const int kPacketIntervalMs = 11;
 
-/// Período de consulta de RSSI en el receptor (ms).
+/// Período de consulta de RSSI (ms).
 const int kRssiPollIntervalMs = 1000;
 
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo.
@@ -55,27 +58,35 @@ class BluetoothManager {
   BluetoothManager({DspProcessor? dspProcessor})
       : _dsp = dspProcessor ?? DspProcessor();
 
-  // ── Estado interno ────────────────────────────────────────────────────────
+  // ── Estado de conexión ────────────────────────────────────────────────────
   BluetoothConnection? _connection;
-  bool _isTransmitting = false;
-  bool _isReceiving = false;
-
-  // ── Estado del emisor (servidor SPP) ──────────────────────────────────────
+  bool _serverTxActive = false; // anfitrión: hay un cliente conectado
   StreamSubscription<SppServerEvent>? _serverEventsSub;
+
+  // ── Estado de TX (captura y envío del micrófono propio) ──────────────────
   StreamSubscription<Uint8List>? _pcmSub;
-  bool _serverTxActive = false; // hay cliente conectado al servidor
   final BytesBuilder _burstBuilder = BytesBuilder(copy: true);
   int _txBurstId = 0;
   int _txSeq = 0;
   Future<void> _sendChain = Future.value();
-  final List<int> _ackBuffer = [];
 
-  // ── Estado de ráfaga del receptor ─────────────────────────────────────────
+  // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
+  int _rxSampleRate = kMicSampleRate;
+  int _rxNumChannels = kMicNumChannels;
+  int _rxBitsPerSample = kMicBitsPerSample;
+  void Function(int sr, int nc, int bps)? _onWavInfoCallback;
+
+  /// Drena el Jitter Buffer a ritmo constante (independiente de la llegada
+  /// a ráfagas de los paquetes BT) para que la reproducción sea uniforme y
+  /// el indicador de llenado del buffer refleje el estado real.
+  Timer? _playbackTimer;
+
+  // ── Estado de ráfaga entrante en curso ────────────────────────────────────
   int? _rxBurstId;
   int? _rxBurstTxEpochMs;
   int _rxBurstBytesRemaining = 0;
 
-  // ── Métricas del receptor ─────────────────────────────────────────────────
+  // ── Métricas de recepción ──────────────────────────────────────────────────
   int _lastSequenceNumber = -1;
   int _totalPacketsReceived = 0;
   int _totalPacketsLost = 0;
@@ -107,7 +118,7 @@ class BluetoothManager {
   /// Stream de mensajes de estado para la UI.
   Stream<String> get statusStream => _statusController.stream;
 
-  /// Stream de latencias por ráfaga (RTT en emisor, tránsito en receptor).
+  /// Stream de latencias por ráfaga (RTT de los paquetes propios enviados).
   Stream<LatencyMetric> get latencyStream => _latencyController.stream;
 
   /// Instancia DSP expuesta para acceso al Jitter Buffer desde la UI.
@@ -117,7 +128,6 @@ class BluetoothManager {
   // ESCANEO Y LISTADO DE DISPOSITIVOS
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Retorna la lista de dispositivos Bluetooth clásicos emparejados.
   Future<List<BluetoothDevice>> getPairedDevices() async {
     try {
       return await FlutterBluetoothSerial.instance.getBondedDevices();
@@ -127,27 +137,22 @@ class BluetoothManager {
     }
   }
 
-  /// Inicia el descubrimiento de dispositivos cercanos.
   Stream<BluetoothDiscoveryResult> startDiscovery() {
     return FlutterBluetoothSerial.instance.startDiscovery();
   }
 
-  /// Cancela un descubrimiento en curso.
   Future<void> cancelDiscovery() async {
     await FlutterBluetoothSerial.instance.cancelDiscovery();
   }
 
-  /// Solicita activar el adaptador Bluetooth.
   Future<bool> requestEnable() async {
     return await FlutterBluetoothSerial.instance.requestEnable() ?? false;
   }
 
-  /// Solicita que el adaptador Bluetooth sea descubrible por 120 segundos.
   Future<void> requestDiscoverable() async {
     await FlutterBluetoothSerial.instance.requestDiscoverable(120);
   }
 
-  /// Solicita emparejamiento con el dispositivo indicado.
   Future<bool> bondDevice(String address) async {
     try {
       return await FlutterBluetoothSerial.instance
@@ -160,72 +165,73 @@ class BluetoothManager {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // ROL EMISOR — SERVIDOR SPP NATIVO
+  // SESIÓN — ANFITRIÓN (escucha una conexión entrante)
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Inicia el servidor SPP y, cuando el receptor conecta, captura el
-  /// micrófono y transmite ráfagas de audio de [kBurstDurationMs] ms.
-  Future<void> startMicBurstTransmitter() async {
-    await _startServer(onClientConnected: () async {
-      // Informar formato del stream al receptor (meta-paquete 0xCC 0xDD)
-      await _sendStreamInfoPacket(
-        sampleRate: kMicSampleRate,
-        numChannels: kMicNumChannels,
-        bitsPerSample: kMicBitsPerSample,
-      );
-      final pcmStream = await _capture.startCapture();
-      _pcmSub = pcmStream.listen(_onPcmChunk);
-      _statusController.add(
-          'Conectado. Capturando voz en ráfagas de ${kBurstDurationMs ~/ 1000} s…');
-    });
-  }
-
-  /// Inicia el servidor SPP y, cuando el receptor conecta, transmite el
-  /// archivo WAV indicado (modo alternativo al micrófono).
-  Future<void> startWavServerTransmitter({
-    required String wavFilePath,
-    required WavHeader wavHeader,
+  /// Inicia la sesión como anfitrión.
+  ///
+  /// · Si [wavFilePath]/[wavHeader] se proveen: transmite ese archivo una vez
+  ///   conectado (modo laboratorio, señal de prueba controlada).
+  /// · En caso contrario, si [micEnabled]: captura y transmite el micrófono
+  ///   propio en ráfagas de 2 s.
+  ///
+  /// La recepción y reproducción de audio entrante (del otro lado) SIEMPRE
+  /// está activa — así el anfitrión también escucha lo que el participante
+  /// le hable de vuelta.
+  Future<void> startAsHost({
+    required void Function(int sampleRate, int numChannels, int bitsPerSample)
+        onWavInfo,
+    bool micEnabled = true,
+    String? wavFilePath,
+    WavHeader? wavHeader,
   }) async {
-    await _startServer(onClientConnected: () async {
-      await _transmitWav(wavFilePath: wavFilePath, wavHeader: wavHeader);
-    });
-  }
-
-  Future<void> _startServer({
-    required Future<void> Function() onClientConnected,
-  }) async {
-    _isTransmitting = true;
-    _txBurstId = 0;
-    _txSeq = 0;
-    _ackBuffer.clear();
-    _burstBuilder.clear();
+    _onWavInfoCallback = onWavInfo;
+    _resetRxState();
+    _resetTxState();
 
     _serverEventsSub = _sppServer.events().listen((event) async {
       switch (event.type) {
         case SppServerEventType.waiting:
-          _statusController
-              .add('Esperando conexión entrante… (hazte visible si no apareces)');
+          _statusController.add(
+              'Esperando conexión entrante… (hazte visible si no apareces)');
           break;
 
         case SppServerEventType.connected:
           _serverTxActive = true;
-          _log.i('Cliente conectado: ${event.deviceName} (${event.deviceAddress})');
-          _statusController.add('Receptor conectado: ${event.deviceName}');
+          _log.i(
+              'Participante conectado: ${event.deviceName} (${event.deviceAddress})');
+          _statusController.add('Conectado: ${event.deviceName}');
           try {
-            await onClientConnected();
+            _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+            if (wavFilePath != null && wavHeader != null) {
+              await _sendStreamInfoPacket(
+                sampleRate: wavHeader.sampleRate,
+                numChannels: wavHeader.numChannels,
+                bitsPerSample: wavHeader.bitsPerSample,
+              );
+              unawaited(_transmitWav(
+                  wavFilePath: wavFilePath, wavHeader: wavHeader));
+            } else if (micEnabled) {
+              await _sendStreamInfoPacket(
+                sampleRate: kMicSampleRate,
+                numChannels: kMicNumChannels,
+                bitsPerSample: kMicBitsPerSample,
+              );
+              await _beginMicTx();
+            }
           } catch (e) {
-            _log.e('Error iniciando transmisión: $e');
-            _statusController.add('Error iniciando transmisión: $e');
+            _log.e('Error iniciando sesión: $e');
+            _statusController.add('Error iniciando sesión: $e');
           }
           break;
 
         case SppServerEventType.data:
-          if (event.bytes != null) _onAckData(event.bytes!);
+          if (event.bytes != null) _onIncomingBytes(event.bytes!);
           break;
 
         case SppServerEventType.disconnected:
           _serverTxActive = false;
-          _statusController.add('Receptor desconectado');
+          _statusController.add('Participante desconectado');
           await _capture.stopCapture();
           break;
 
@@ -238,7 +244,76 @@ class BluetoothManager {
     });
 
     await _sppServer.start();
-    _statusController.add('Servidor SPP iniciado. Esperando al receptor…');
+    _statusController.add('Servidor SPP iniciado. Esperando…');
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // SESIÓN — PARTICIPANTE (se une como cliente)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /// Se une a la sesión del anfitrión en [address]. Si [micEnabled], también
+  /// captura y transmite su propio micrófono — con esto la conversación es
+  /// bidireccional (ambos lados hablan y escuchan por el mismo socket).
+  Future<void> joinAsClient({
+    required String address,
+    required String name,
+    required void Function(int sampleRate, int numChannels, int bitsPerSample)
+        onWavInfo,
+    bool micEnabled = true,
+  }) async {
+    _onWavInfoCallback = onWavInfo;
+    _log.i('Uniéndose a $name ($address)…');
+    _statusController.add('Conectando a $name…');
+
+    try {
+      _connection = await BluetoothConnection.toAddress(address);
+      _log.i('Conexión establecida');
+      _statusController.add('Conectado. Sesión activa…');
+
+      _resetRxState();
+      _resetTxState();
+      _startRssiPolling(address);
+      _beginPlayback(kMicSampleRate, kMicNumChannels, kMicBitsPerSample);
+
+      _connection!.input!.listen(
+        _onIncomingBytes,
+        onDone: () {
+          _log.i('Conexión cerrada por el anfitrión');
+          _statusController.add('Sesión finalizada');
+          _rssiTimer?.cancel();
+        },
+        onError: (Object error) {
+          _log.e('Error en stream de entrada: $error');
+          _statusController.add('Error de recepción: $error');
+          _rssiTimer?.cancel();
+        },
+        cancelOnError: false,
+      );
+
+      if (micEnabled) {
+        await _sendStreamInfoPacket(
+          sampleRate: kMicSampleRate,
+          numChannels: kMicNumChannels,
+          bitsPerSample: kMicBitsPerSample,
+        );
+        await _beginMicTx();
+      }
+    } catch (e) {
+      _log.e('Error uniéndose a la sesión: $e');
+      _statusController.add('Error: $e');
+      rethrow;
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX — CAPTURA Y ENVÍO DEL MICRÓFONO PROPIO (ambos lados)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  Future<void> _beginMicTx() async {
+    final pcmStream = await _capture.startCapture();
+    _pcmSub = pcmStream.listen(_onPcmChunk);
+    _statusController
+        .add('Capturando voz en ráfagas de ${kBurstDurationMs ~/ 1000} s…');
   }
 
   /// Acumula PCM del micrófono; al completar una ráfaga de 2 s la encola
@@ -264,8 +339,6 @@ class BluetoothManager {
 
   /// Envía una ráfaga completa: cabecera con timestamp + paquetes de datos.
   Future<void> _sendBurst(int burstId, Uint8List pcm) async {
-    if (!_serverTxActive) return;
-
     final int txEpochMs = DateTime.now().millisecondsSinceEpoch;
     await _txWrite(buildBurstHeaderPacket(
       burstId: burstId,
@@ -275,7 +348,7 @@ class BluetoothManager {
 
     int offset = 0;
     int packets = 0;
-    while (offset < pcm.length && _serverTxActive) {
+    while (offset < pcm.length) {
       final int end = (offset + kPayloadSize).clamp(0, pcm.length);
       Uint8List payload = Uint8List.sublistView(pcm, offset, end);
       if (payload.length < kPayloadSize) {
@@ -288,49 +361,11 @@ class BluetoothManager {
     }
 
     final int sendMs = DateTime.now().millisecondsSinceEpoch - txEpochMs;
-    _log.i('TX ráfaga #$burstId: ${pcm.length} B en $packets paquetes ($sendMs ms)');
-    _statusController.add('Ráfaga #$burstId enviada: $packets paquetes en $sendMs ms');
+    _log.i(
+        'TX ráfaga #$burstId: ${pcm.length} B en $packets paquetes ($sendMs ms)');
   }
 
-  /// Parsea ACKs (receptor → emisor) del stream entrante del servidor y
-  /// calcula el RTT de bloque con el reloj local del emisor.
-  void _onAckData(Uint8List bytes) {
-    _ackBuffer.addAll(bytes);
-    while (true) {
-      int idx = -1;
-      for (int i = 0; i + 1 < _ackBuffer.length; i++) {
-        if (_ackBuffer[i] == kAckMagic0 && _ackBuffer[i + 1] == kAckMagic1) {
-          idx = i;
-          break;
-        }
-      }
-      if (idx == -1) {
-        if (_ackBuffer.length > 1) {
-          _ackBuffer.removeRange(0, _ackBuffer.length - 1);
-        }
-        return;
-      }
-      if (idx > 0) _ackBuffer.removeRange(0, idx);
-      if (_ackBuffer.length < kAckPacketSize) return;
-
-      final ack = BurstAck.parse(
-          Uint8List.fromList(_ackBuffer.sublist(0, kAckPacketSize)));
-      _ackBuffer.removeRange(0, kAckPacketSize);
-
-      final double rttMs =
-          (DateTime.now().millisecondsSinceEpoch - ack.txEpochMs).toDouble();
-      _log.i('ACK ráfaga #${ack.burstId}: latencia de bloque (RTT) '
-          '${rttMs.toStringAsFixed(0)} ms');
-      _latencyController.add(LatencyMetric(
-        burstId: ack.burstId,
-        latencyMs: rttMs,
-        isRoundTrip: true,
-        timestamp: DateTime.now(),
-      ));
-    }
-  }
-
-  /// Escritura unificada de TX: servidor nativo (emisor) o socket cliente.
+  /// Escritura unificada de TX: servidor nativo (anfitrión) o socket cliente.
   Future<void> _txWrite(Uint8List bytes) async {
     if (_serverTxActive) {
       await _sppServer.write(bytes);
@@ -343,10 +378,9 @@ class BluetoothManager {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TRANSMISIÓN DE ARCHIVO WAV (modo alternativo)
+  // TRANSMISIÓN DE ARCHIVO WAV (modo laboratorio, solo anfitrión)
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Lee el archivo WAV, extrae los datos PCM y los envía en paquetes numerados.
   Future<void> _transmitWav({
     required String wavFilePath,
     required WavHeader wavHeader,
@@ -356,7 +390,7 @@ class BluetoothManager {
     final file = File(wavFilePath);
     final allBytes = await file.readAsBytes();
     final pcmStart = wavHeader.dataOffset;
-    final pcmEnd   = pcmStart + wavHeader.dataSize;
+    final pcmEnd = pcmStart + wavHeader.dataSize;
 
     if (pcmEnd > allBytes.length) {
       throw FormatException(
@@ -370,19 +404,10 @@ class BluetoothManager {
     int sequenceNumber = 0;
     int offset = 0;
 
-    // ── Enviar cabecera WAV como primer "paquete especial" ────────────────
-    await _sendStreamInfoPacket(
-      sampleRate: wavHeader.sampleRate,
-      numChannels: wavHeader.numChannels,
-      bitsPerSample: wavHeader.bitsPerSample,
-    );
-
-    // ── Enviar bloques PCM en bucle ────────────────────────────────────────
-    while (_isTransmitting && _serverTxActive && offset < pcmBytes.length) {
+    while (_serverTxActive && offset < pcmBytes.length) {
       final int end = (offset + kPayloadSize).clamp(0, pcmBytes.length);
       final payload = Uint8List.fromList(pcmBytes.sublist(offset, end));
 
-      // Rellena el último paquete incompleto con ceros (silencio PCM)
       final Uint8List paddedPayload = payload.length < kPayloadSize
           ? (Uint8List(kPayloadSize)..setRange(0, payload.length, payload))
           : payload;
@@ -398,14 +423,12 @@ class BluetoothManager {
 
       sequenceNumber++;
       offset += kPayloadSize;
-
-      // Throttle: mantener cadencia ~constante para no inundar el socket
       await Future.delayed(const Duration(milliseconds: kPacketIntervalMs));
     }
 
-    // Paquete de fin de transmisión (magic bytes especiales: 0xFF 0xFF)
     await _sendEndOfStreamPacket();
-    _statusController.add('Transmisión completada. $sequenceNumber paquetes enviados.');
+    _statusController
+        .add('Transmisión completada. $sequenceNumber paquetes enviados.');
     _log.i('Transmisión finalizada: $sequenceNumber paquetes');
   }
 
@@ -417,7 +440,7 @@ class BluetoothManager {
     required int bitsPerSample,
   }) async {
     final meta = Uint8List(kPacketSize);
-    meta[0] = 0xCC; // magic de meta-paquete
+    meta[0] = 0xCC;
     meta[1] = 0xDD;
     meta[2] = numChannels & 0xFF;
     meta[3] = bitsPerSample & 0xFF;
@@ -427,7 +450,6 @@ class BluetoothManager {
     await Future.delayed(const Duration(milliseconds: 20));
   }
 
-  /// Envía paquete señalizador de fin de stream.
   Future<void> _sendEndOfStreamPacket() async {
     final eos = Uint8List(kPacketSize);
     eos[0] = 0xFF;
@@ -442,94 +464,30 @@ class BluetoothManager {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // ROL RECEPTOR — CLIENTE SPP
+  // RX — PIPELINE UNIFICADO (anfitrión y participante usan el mismo código)
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Conecta al emisor (que escucha en modo servidor) y comienza a recibir.
-  ///
-  /// [address]/[name] : dispositivo BT del emisor (emparejado previamente).
-  /// [onWavInfo]      : callback con parámetros del stream de audio.
-  Future<void> connectAndReceive({
-    required String address,
-    required String name,
-    required void Function(int sampleRate, int numChannels, int bitsPerSample) onWavInfo,
-  }) async {
-    _log.i('Receptor conectando a $name ($address)…');
-    _statusController.add('Conectando a $name…');
-
-    try {
-      _connection = await BluetoothConnection.toAddress(address);
-      _log.i('Conexión establecida');
-      _statusController.add('Conectado. Recibiendo audio…');
-
-      _isReceiving = true;
-      _lastSequenceNumber = -1;
-      _totalPacketsReceived = 0;
-      _totalPacketsLost = 0;
-      _receiveBuffer.clear();
-      _rxBurstId = null;
-      _rxBurstTxEpochMs = null;
-      _rxBurstBytesRemaining = 0;
-      _dsp.reset();
-
-      // Iniciar polling de RSSI
-      _startRssiPolling(address);
-
-      // Parámetros de audio por defecto; se actualizan con el meta-paquete
-      int sampleRate  = 44100;
-      int numChannels = 1;
-      int bitsPerSample = 16;
-
-      // Escuchar el stream de bytes del socket
-      _connection!.input!.listen(
-        (Uint8List chunk) {
-          _receiveBuffer.addAll(chunk);
-          _processReceiveBuffer(
-            onWavInfo: (sr, nc, bps) {
-              sampleRate    = sr;
-              numChannels   = nc;
-              bitsPerSample = bps;
-              onWavInfo(sr, nc, bps);
-            },
-            sampleRate:    sampleRate,
-            numChannels:   numChannels,
-            bitsPerSample: bitsPerSample,
-          );
-        },
-        onDone: () {
-          _log.i('Conexión cerrada por el emisor');
-          _statusController.add('Transmisión finalizada');
-          _isReceiving = false;
-          _rssiTimer?.cancel();
-        },
-        onError: (Object error) {
-          _log.e('Error en stream de entrada: $error');
-          _statusController.add('Error de recepción: $error');
-          _isReceiving = false;
-          _rssiTimer?.cancel();
-        },
-        cancelOnError: false,
-      );
-    } catch (e) {
-      _log.e('Error conectando receptor: $e');
-      _statusController.add('Error: $e');
-      rethrow;
-    }
+  /// Punto de entrada único para bytes entrantes, vengan del socket cliente
+  /// (participante) o de los eventos del servidor nativo (anfitrión).
+  void _onIncomingBytes(Uint8List chunk) {
+    _receiveBuffer.addAll(chunk);
+    _processReceiveBuffer();
   }
 
-  /// Procesa el buffer de reensamblado buscando paquetes completos de [kPacketSize] bytes.
-  void _processReceiveBuffer({
-    required void Function(int sr, int nc, int bps) onWavInfo,
-    required int sampleRate,
-    required int numChannels,
-    required int bitsPerSample,
-  }) {
-    while (_receiveBuffer.length >= kPacketSize) {
-      // Sincronización: buscar magic bytes válidos
-      int syncIndex = _findSyncIndex();
+  /// Determina el tamaño esperado de paquete según sus magic bytes: el ACK
+  /// es más corto (20 B) que el resto de tipos (kPacketSize, 1024 B).
+  int _expectedPacketLength(int b0, int b1) {
+    if (b0 == kAckMagic0 && b1 == kAckMagic1) return kAckPacketSize;
+    return kPacketSize;
+  }
+
+  /// Procesa el buffer de reensamblado buscando paquetes completos.
+  /// El tamaño de cada paquete depende de su tipo (ver [_expectedPacketLength]),
+  /// por eso no se puede asumir un framing de longitud fija para todo el stream.
+  void _processReceiveBuffer() {
+    while (_receiveBuffer.length >= 2) {
+      final int syncIndex = _findSyncIndex();
       if (syncIndex == -1) {
-        // No hay inicio de paquete en el buffer; descartar todo excepto los
-        // últimos 3 bytes (podrían ser el inicio de un paquete partido)
         if (_receiveBuffer.length > 3) {
           _receiveBuffer.removeRange(0, _receiveBuffer.length - 3);
         }
@@ -537,23 +495,20 @@ class BluetoothManager {
       }
 
       if (syncIndex > 0) {
-        // Descartar bytes hasta el inicio del paquete (resincronización)
         _receiveBuffer.removeRange(0, syncIndex);
         _log.w('Resincronización: descartados $syncIndex bytes');
       }
 
-      if (_receiveBuffer.length < kPacketSize) break;
+      if (_receiveBuffer.length < 2) return;
+      final int expectedLen =
+          _expectedPacketLength(_receiveBuffer[0], _receiveBuffer[1]);
+      if (_receiveBuffer.length < expectedLen) return; // esperar más bytes
 
-      final packetBytes = Uint8List.fromList(
-          _receiveBuffer.sublist(0, kPacketSize));
-      _receiveBuffer.removeRange(0, kPacketSize);
+      final packetBytes =
+          Uint8List.fromList(_receiveBuffer.sublist(0, expectedLen));
+      _receiveBuffer.removeRange(0, expectedLen);
 
-      _handleIncomingPacket(
-        packet: packetBytes,
-        onWavInfo: onWavInfo,
-        numChannels: numChannels,
-        bitsPerSample: bitsPerSample,
-      );
+      _handleIncomingPacket(packetBytes);
     }
   }
 
@@ -562,10 +517,12 @@ class BluetoothManager {
     for (int i = 0; i < _receiveBuffer.length - 1; i++) {
       final b0 = _receiveBuffer[i];
       final b1 = _receiveBuffer[i + 1];
-      if ((b0 == kMagicByte0 && b1 == kMagicByte1) ||       // paquete de datos
-          (b0 == 0xCC && b1 == 0xDD) ||                      // meta-paquete audio
-          (b0 == kBurstMagic0 && b1 == kBurstMagic1) ||      // cabecera de ráfaga
-          (b0 == 0xFF && b1 == 0xFF)) {                      // fin de stream
+      if ((b0 == kMagicByte0 && b1 == kMagicByte1) || // paquete de datos
+          (b0 == 0xCC && b1 == 0xDD) || // meta-paquete audio
+          (b0 == kBurstMagic0 && b1 == kBurstMagic1) || // cabecera de ráfaga
+          (b0 == kAckMagic0 && b1 == kAckMagic1) || // ACK de ráfaga
+          (b0 == 0xFF && b1 == 0xFF)) {
+        // fin de stream
         return i;
       }
     }
@@ -573,27 +530,38 @@ class BluetoothManager {
   }
 
   /// Despacha el paquete según su tipo.
-  void _handleIncomingPacket({
-    required Uint8List packet,
-    required void Function(int sr, int nc, int bps) onWavInfo,
-    required int numChannels,
-    required int bitsPerSample,
-  }) {
+  void _handleIncomingPacket(Uint8List packet) {
     final b0 = packet[0];
     final b1 = packet[1];
 
     // ── Meta-paquete de formato de audio ────────────────────────────────
     if (b0 == 0xCC && b1 == 0xDD) {
-      final nc  = packet[2];
+      final nc = packet[2];
       final bps = packet[3];
       final view = ByteData.sublistView(packet);
-      final sr  = view.getUint32(4, Endian.little);
+      final sr = view.getUint32(4, Endian.little);
       _log.i('Meta-paquete audio: ${sr}Hz, ${nc}ch, ${bps}bit');
-      onWavInfo(sr, nc, bps);
+      _beginPlayback(sr, nc, bps);
       return;
     }
 
-    // ── Cabecera de ráfaga (modo micrófono P2P) ─────────────────────────
+    // ── ACK de ráfaga propia (RTT medido con el reloj local) ────────────
+    if (b0 == kAckMagic0 && b1 == kAckMagic1) {
+      final ack = BurstAck.parse(packet);
+      final double rttMs =
+          (DateTime.now().millisecondsSinceEpoch - ack.txEpochMs).toDouble();
+      _log.i('ACK ráfaga #${ack.burstId}: latencia de bloque (RTT) '
+          '${rttMs.toStringAsFixed(0)} ms');
+      _latencyController.add(LatencyMetric(
+        burstId: ack.burstId,
+        latencyMs: rttMs,
+        isRoundTrip: true,
+        timestamp: DateTime.now(),
+      ));
+      return;
+    }
+
+    // ── Cabecera de ráfaga entrante ──────────────────────────────────────
     if (b0 == kBurstMagic0 && b1 == kBurstMagic1) {
       final header = BurstHeader.parse(packet);
       _rxBurstId = header.burstId;
@@ -613,7 +581,8 @@ class BluetoothManager {
 
     // ── Paquete de datos normal ──────────────────────────────────────────
     if (b0 != kMagicByte0 || b1 != kMagicByte1) {
-      _log.w('Magic bytes inválidos: 0x${b0.toRadixString(16)} 0x${b1.toRadixString(16)}');
+      _log.w(
+          'Magic bytes inválidos: 0x${b0.toRadixString(16)} 0x${b1.toRadixString(16)}');
       return;
     }
 
@@ -625,24 +594,22 @@ class BluetoothManager {
     if (_lastSequenceNumber != -1) {
       final int expected = (_lastSequenceNumber + 1) & 0xFFFF;
       if (seqNum != expected) {
-        // Calcular paquetes perdidos en el hueco (módulo 65536)
         lostInGap = ((seqNum - expected) & 0xFFFF);
-        // Limitar a un máximo razonable para evitar conteo erróneo por reordenamiento
-        if (lostInGap > kMaxConsecutiveLostPackets) lostInGap = kMaxConsecutiveLostPackets;
+        if (lostInGap > kMaxConsecutiveLostPackets) {
+          lostInGap = kMaxConsecutiveLostPackets;
+        }
         _totalPacketsLost += lostInGap;
         _log.w('Pérdida detectada: seq esperada=$expected recibida=$seqNum '
             'perdidos=$lostInGap');
 
-        // Generar bloques PLC para cada paquete perdido
         for (int i = 0; i < lostInGap; i++) {
-          final plcBlock = _dsp.processBlock(
+          _dsp.processBlock(
             rawBlock: null,
             rssiDbm: _currentRssi,
             isLost: true,
-            numChannels: numChannels,
-            bitsPerSample: bitsPerSample,
+            numChannels: _rxNumChannels,
+            bitsPerSample: _rxBitsPerSample,
           );
-          _audioChunkController.add(plcBlock);
           _consumeBurstBytes(kPayloadSize);
         }
       }
@@ -651,24 +618,21 @@ class BluetoothManager {
     _lastSequenceNumber = seqNum;
     _totalPacketsReceived++;
 
-    // ── Extraer payload y procesar con DSP ──────────────────────────────
+    // ── Extraer payload y procesar con DSP (encola en el Jitter Buffer) ──
     final payload = Uint8List.sublistView(packet, 4, kPacketSize);
-    final processedBlock = _dsp.processBlock(
+    _dsp.processBlock(
       rawBlock: payload,
       rssiDbm: _currentRssi,
       isLost: false,
-      numChannels: numChannels,
-      bitsPerSample: bitsPerSample,
+      numChannels: _rxNumChannels,
+      bitsPerSample: _rxBitsPerSample,
     );
-
-    _audioChunkController.add(processedBlock);
     _consumeBurstBytes(kPayloadSize);
 
     // ── Emitir métricas actualizadas ─────────────────────────────────────
     final total = _totalPacketsReceived + _totalPacketsLost;
-    final lossPercent = total > 0
-        ? (_totalPacketsLost / total * 100.0)
-        : 0.0;
+    final lossPercent =
+        total > 0 ? (_totalPacketsLost / total * 100.0) : 0.0;
 
     _metricsController.add(ChannelMetrics(
       rssiDbm: _currentRssi,
@@ -681,7 +645,8 @@ class BluetoothManager {
   }
 
   /// Descuenta bytes de la ráfaga en curso; al completarla estima el tiempo
-  /// de tránsito, emite la métrica y responde ACK al emisor.
+  /// de tránsito, emite la métrica y responde ACK (fire-and-forget: no debe
+  /// bloquear el pipeline de recepción si la escritura tarda).
   void _consumeBurstBytes(int bytes) {
     if (_rxBurstId == null) return;
     _rxBurstBytesRemaining -= bytes;
@@ -699,16 +664,13 @@ class BluetoothManager {
       timestamp: DateTime.now(),
     ));
 
-    // ACK de vuelta al emisor por el mismo socket (canal bidireccional)
-    try {
-      _connection?.output.add(buildAckPacket(
-        burstId: _rxBurstId!,
-        txEpochMs: _rxBurstTxEpochMs!,
-        rxEpochMs: rxEpochMs,
-      ));
-    } catch (e) {
+    unawaited(_txWrite(buildAckPacket(
+      burstId: _rxBurstId!,
+      txEpochMs: _rxBurstTxEpochMs!,
+      rxEpochMs: rxEpochMs,
+    )).catchError((Object e) {
       _log.w('No se pudo enviar ACK de ráfaga #$_rxBurstId: $e');
-    }
+    }));
 
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
@@ -716,33 +678,64 @@ class BluetoothManager {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
+  // REPRODUCCIÓN — DRENADO DEL JITTER BUFFER A RITMO CONSTANTE
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /// Fija el formato de audio entrante, notifica a la UI (para que arranque
+  /// el motor de reproducción) y arranca el drenado periódico del buffer.
+  void _beginPlayback(int sampleRate, int numChannels, int bitsPerSample) {
+    _rxSampleRate = sampleRate;
+    _rxNumChannels = numChannels;
+    _rxBitsPerSample = bitsPerSample;
+    _onWavInfoCallback?.call(sampleRate, numChannels, bitsPerSample);
+    _startPlaybackDrain();
+  }
+
+  /// Duración en ms del audio contenido en un bloque de [kPayloadSize] bytes,
+  /// según el formato (sampleRate/canales/bits) actualmente conocido.
+  double _computeBlockDurationMs() {
+    final int bytesPerFrame = _rxNumChannels * (_rxBitsPerSample ~/ 8);
+    if (bytesPerFrame <= 0 || _rxSampleRate <= 0) return 32.0;
+    final double frames = kPayloadSize / bytesPerFrame;
+    return frames / _rxSampleRate * 1000.0;
+  }
+
+  /// Arranca (o reinicia, si cambia el formato) el timer que extrae bloques
+  /// del Jitter Buffer al ritmo real de reproducción. Esto desacopla la
+  /// llegada a ráfagas de los paquetes BT del consumo del audio, que es lo
+  /// que hace que `bufferFillRatio` refleje el estado real del buffer en
+  /// lugar de vaciarse instantáneamente en cada paquete recibido.
+  void _startPlaybackDrain() {
+    _playbackTimer?.cancel();
+    final double ms = _computeBlockDurationMs().clamp(5.0, 100.0);
+    _playbackTimer = Timer.periodic(
+      Duration(microseconds: (ms * 1000).round()),
+      (_) {
+        final block = _dsp.jitterBuffer.pop();
+        _audioChunkController.add(block ?? Uint8List(kPayloadSize));
+      },
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
   // POLLING DE RSSI
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Consulta el RSSI de la conexión BT activa cada [kRssiPollIntervalMs] ms.
   void _startRssiPolling(String address) {
     _rssiTimer = Timer.periodic(
       const Duration(milliseconds: kRssiPollIntervalMs),
       (_) async {
         try {
-          // Intento de lectura real de RSSI via método nativo
           final rssi = await _getRssiNative(address);
           _currentRssi = rssi;
         } catch (_) {
-          // Fallback: mantener último valor conocido con pequeña variación
-          // para simular fluctuaciones reales del canal
           _currentRssi += (_currentRssi > -90.0 ? -0.5 : 0.5);
         }
       },
     );
   }
 
-  /// Llama al canal nativo para leer el RSSI real del dispositivo conectado.
-  /// Lanza excepción si no está disponible (Android < 8 / iOS).
   Future<double> _getRssiNative(String address) async {
-    // En Android >= 8, BluetoothDevice.readRemoteRssi() está disponible.
-    // Aquí se invoca vía MethodChannel registrado en MainActivity.kt.
-    // Si falla, relanza para que el caller use el fallback.
     throw UnimplementedError('Canal nativo RSSI no implementado en esta plataforma');
   }
 
@@ -750,20 +743,33 @@ class BluetoothManager {
   // CONTROL DE CICLO DE VIDA
   // ──────────────────────────────────────────────────────────────────────────
 
-  /// Detiene la transmisión o recepción y cierra la conexión.
-  Future<void> disconnect() async {
-    _isTransmitting = false;
-    _isReceiving = false;
-    _serverTxActive = false;
-    _rssiTimer?.cancel();
-    _rssiTimer = null;
+  void _resetRxState() {
     _receiveBuffer.clear();
-    _ackBuffer.clear();
-    _burstBuilder.clear();
+    _lastSequenceNumber = -1;
+    _totalPacketsReceived = 0;
+    _totalPacketsLost = 0;
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
     _rxBurstBytesRemaining = 0;
     _dsp.reset();
+  }
+
+  void _resetTxState() {
+    _txBurstId = 0;
+    _txSeq = 0;
+    _burstBuilder.clear();
+    _sendChain = Future.value();
+  }
+
+  /// Detiene la transmisión/recepción y cierra la conexión.
+  Future<void> disconnect() async {
+    _serverTxActive = false;
+    _rssiTimer?.cancel();
+    _rssiTimer = null;
+    _playbackTimer?.cancel();
+    _playbackTimer = null;
+    _resetRxState();
+    _resetTxState();
 
     await _pcmSub?.cancel();
     _pcmSub = null;
@@ -799,8 +805,6 @@ class BluetoothManager {
 
   bool get isConnected =>
       _serverTxActive || (_connection?.isConnected ?? false);
-  bool get isTransmitting => _isTransmitting;
-  bool get isReceiving => _isReceiving;
 
   ChannelMetrics get currentMetrics {
     final total = _totalPacketsReceived + _totalPacketsLost;

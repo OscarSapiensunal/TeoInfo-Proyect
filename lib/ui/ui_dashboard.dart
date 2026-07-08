@@ -3,10 +3,10 @@
 // Pantalla principal — Dashboard de análisis DSP/BT en tiempo real.
 //
 // Secciones:
-//   1. Header con selector de rol (Transmisor / Receptor).
-//   2. Panel de archivo WAV (solo modo Transmisor).
+//   1. Header con selector de rol de conexión (Anfitrión / Participante).
+//   2. Modo de sesión (conversación bidireccional / archivo WAV) + toggle de mic.
 //   3. Selector de dispositivo BT emparejado.
-//   4. Panel de métricas en tiempo real (RSSI, Packet Loss, Buffer).
+//   4. Panel de latencias y métricas en tiempo real (RSSI, Packet Loss, Buffer).
 //   5. Gráfica dinámica RSSI vs Packet Loss (fl_chart LineChart).
 //   6. Botón de inicio / detención de sesión.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +59,8 @@ class UiDashboard extends StatelessWidget {
               _RoleSelectorCard(),
               SizedBox(height: 12),
               _TxSourceCard(),
+              SizedBox(height: 12),
+              _MicToggleCard(),
               SizedBox(height: 12),
               _WavFileCard(),
               SizedBox(height: 12),
@@ -194,19 +196,19 @@ class _RoleSelectorCard extends StatelessWidget {
     final state = context.watch<AppState>();
 
     return _Card(
-      title: 'ROL DEL DISPOSITIVO',
+      title: 'ROL DE CONEXIÓN (ambos hablan y escuchan)',
       icon: Icons.devices,
       child: Row(
         children: [
           _RoleButton(
-            label: 'Emisor',
+            label: 'Anfitrión',
             icon: Icons.upload_rounded,
             selected: state.role == DeviceRole.transmitter,
             onTap: () => state.setRole(DeviceRole.transmitter),
           ),
           const SizedBox(width: 10),
           _RoleButton(
-            label: 'Receptor',
+            label: 'Participante',
             icon: Icons.download_rounded,
             selected: state.role == DeviceRole.receiver,
             onTap: () => state.setRole(DeviceRole.receiver),
@@ -267,7 +269,7 @@ class _RoleButton extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CARD DE FUENTE DE AUDIO (solo Emisor)
+// CARD DE MODO DE SESIÓN (solo Anfitrión)
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _TxSourceCard extends StatelessWidget {
@@ -279,22 +281,73 @@ class _TxSourceCard extends StatelessWidget {
     if (state.role != DeviceRole.transmitter) return const SizedBox.shrink();
 
     return _Card(
-      title: 'FUENTE DE AUDIO',
+      title: 'MODO DE SESIÓN (solo anfitrión)',
       icon: Icons.graphic_eq_rounded,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _RoleButton(
+                label: 'Conversación',
+                icon: Icons.mic_rounded,
+                selected: state.txSource == AudioTxSource.microphone,
+                onTap: () => state.setTxSource(AudioTxSource.microphone),
+              ),
+              const SizedBox(width: 10),
+              _RoleButton(
+                label: 'Archivo WAV',
+                icon: Icons.audio_file_rounded,
+                selected: state.txSource == AudioTxSource.wavFile,
+                onTap: () => state.setTxSource(AudioTxSource.wavFile),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            state.txSource == AudioTxSource.microphone
+                ? 'Bidireccional: ambos lados hablan y escuchan por micrófono.'
+                : 'Unidireccional: solo el anfitrión transmite el archivo (señal de prueba controlada para el informe).',
+            style: const TextStyle(color: _C.textMuted, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOGGLE DE MICRÓFONO PROPIO (ambos roles, salvo anfitrión en modo WAV)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _MicToggleCard extends StatelessWidget {
+  const _MicToggleCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (state.role == DeviceRole.none) return const SizedBox.shrink();
+    final hostInWavMode = state.role == DeviceRole.transmitter &&
+        state.txSource == AudioTxSource.wavFile;
+    if (hostInWavMode) return const SizedBox.shrink();
+
+    return _Card(
+      title: 'MI MICRÓFONO',
+      icon: Icons.mic_rounded,
       child: Row(
         children: [
-          _RoleButton(
-            label: 'Micrófono (2 s)',
-            icon: Icons.mic_rounded,
-            selected: state.txSource == AudioTxSource.microphone,
-            onTap: () => state.setTxSource(AudioTxSource.microphone),
+          Expanded(
+            child: Text(
+              state.micEnabled
+                  ? 'Activo: este teléfono también habla (ráfagas de ${kBurstDurationMs ~/ 1000} s).'
+                  : 'Desactivado: este teléfono solo escucha.',
+              style: const TextStyle(color: _C.textMuted, fontSize: 12),
+            ),
           ),
-          const SizedBox(width: 10),
-          _RoleButton(
-            label: 'Archivo WAV',
-            icon: Icons.audio_file_rounded,
-            selected: state.txSource == AudioTxSource.wavFile,
-            onTap: () => state.setTxSource(AudioTxSource.wavFile),
+          Switch(
+            value: state.micEnabled,
+            activeThumbColor: _C.accentGreen,
+            onChanged: state.isActive ? null : state.setMicEnabled,
           ),
         ],
       ),
@@ -355,8 +408,8 @@ class _WavFileCard extends StatelessWidget {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONECTIVIDAD BLUETOOTH P2P
-//   Emisor  : activar BT + hacerse visible (espera conexión entrante).
-//   Receptor: activar BT + escanear + seleccionar/emparejar el emisor.
+//   Anfitrión   : activar BT + hacerse visible (espera conexión entrante).
+//   Participante: activar BT + escanear + seleccionar/emparejar al anfitrión.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _BtConnectivityCard extends StatelessWidget {
@@ -437,8 +490,8 @@ class _BtConnectivityCard extends StatelessWidget {
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 4),
               child: Text(
-                'Hazte visible y pulsa "Iniciar sesión": el emisor queda '
-                'esperando la conexión del receptor.',
+                'Hazte visible y pulsa "Iniciar sesión": el anfitrión queda '
+                'esperando la conexión del participante.',
                 style: TextStyle(color: _C.textMuted, fontSize: 12),
               ),
             ),
@@ -621,7 +674,9 @@ class _MetricsPanelCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (state.role != DeviceRole.receiver) return const SizedBox.shrink();
+    // Ambos roles reciben y reproducen audio (bidireccional), así que ambos
+    // deben ver las métricas de SU PROPIO enlace de recepción.
+    if (state.role == DeviceRole.none) return const SizedBox.shrink();
 
     final m = state.metrics;
 
@@ -772,7 +827,7 @@ class _RealtimeChartCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (state.role != DeviceRole.receiver) return const SizedBox.shrink();
+    if (state.role == DeviceRole.none) return const SizedBox.shrink();
 
     final history = state.chartHistory;
 
@@ -946,8 +1001,8 @@ class _SessionControlButton extends StatelessWidget {
 
     if (state.role == DeviceRole.none) return const SizedBox.shrink();
 
-    // Emisor: queda esperando conexión (no selecciona dispositivo); solo
-    // requiere archivo si la fuente es WAV. Receptor: requiere emisor elegido.
+    // Anfitrión: queda esperando conexión (no selecciona dispositivo); solo
+    // requiere archivo si el modo es WAV. Participante: requiere anfitrión elegido.
     final canStart = !state.isActive &&
         (state.role == DeviceRole.transmitter
             ? (state.txSource == AudioTxSource.microphone ||
