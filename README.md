@@ -72,6 +72,8 @@ Conceptos del curso directamente aplicados:
 | **Filtro adaptativo — cancelación de eco acústico** (Cap. II, filtro con coeficientes variables en el tiempo) | NLMS (Normalized LMS) de 128 taps que estima, muestra a muestra, el eco acústico parlante→micrófono propio y lo resta antes de transmitir (`echo_canceller.dart`); usa la misma ecuación en diferencias que un FIR, pero con `w[k]` adaptándose con `w[k] += (μ·e[n]/‖x‖²)·x[n−k]`. La mitigación PRINCIPAL y garantizada es semi-dúplex (silenciar el micrófono propio mientras el parlante reproduce); el NLMS ataca el eco residual, no reemplaza al semi-dúplex. |
 | **Capacidad de canal de Shannon-Hartley** (Cap. IV) | `C = B·log2(1+SNR)` calculada en vivo: `B` = ancho de banda de Nyquist del muestreo, `SNR` estimado como el RSSI actual sobre un piso de ruido asumido de −95 dBm (`information_theory.dart`). Mostrada junto al RSSI para comparar capacidad teórica contra el throughput real observado. |
 | **Entropía de la fuente** (Cap. IV 4.2) | `H(X) = −Σp(x)·log2(p(x))` estimada por histograma de 256 bins sobre cada clip de voz reproducido, contrastada contra la entropía máxima log2(256)=8 bits/muestra (ruido blanco uniforme) — la voz real siempre da menos, por sus silencios y su distribución de amplitud concentrada. |
+| **Corrección de errores hacia adelante — FEC** (Cap. V) | Código de Hamming (7,4) implementado a mano (`error_correction.dart`): 4 bits de datos → 7 bits con 3 de paridad: `p1=d1⊕d2⊕d4, p2=d1⊕d3⊕d4, p3=d2⊕d3⊕d4`. El síndrome de paridad en el receptor apunta directo a la posición del bit volteado y lo corrige sin pedir reenvío. |
+| **ARQ — repetición automática bajo pedido** (Cap. V) | Al detectar un hueco de secuencia, el receptor envía un NACK pidiendo la ráfaga completa; el emisor, si aún la tiene en caché, la reenvía. Complementa al FEC: FEC corrige bits aislados sin esperar; ARQ recupera pérdidas completas al costo de una ida y vuelta. |
 
 **Qué es implementación propia y qué es infraestructura de terceros** (transparencia metodológica):
 
@@ -90,6 +92,8 @@ Conceptos del curso directamente aplicados:
 | Cancelador de eco acústico (NLMS + semi-dúplex) | **Propio** (`echo_canceller.dart`, `bluetooth_manager.dart`) |
 | Capacidad de Shannon + entropía de la fuente | **Propio** (`information_theory.dart`) |
 | Lectura de RSSI real vía GATT sobre BT Clásico (con *fallback* simulado si el teléfono no la soporta) | **Propio** (`MainActivity.kt` + `rssi_channel.dart`) |
+| FEC — Hamming (7,4), codificación/decodificación/corrección | **Propio** (`error_correction.dart`) |
+| ARQ — protocolo NACK + caché de última ráfaga + reenvío | **Propio** (`app_models.dart` + `bluetooth_manager.dart`) |
 | Socket Bluetooth cliente | Librería `flutter_bluetooth_serial` |
 | Acceso a micrófono y parlante (drivers de audio) | Librería `flutter_sound` |
 | UI y gráficas | Flutter + `fl_chart` |
@@ -153,7 +157,8 @@ lib/
 ├── dsp/
 │   ├── dsp_processor.dart             # Jitter Buffer, PLC, AWGN, filtros IIR+FIR (todo a mano)
 │   ├── echo_canceller.dart            # Cancelador de eco NLMS + semi-dúplex (todo a mano)
-│   └── information_theory.dart       # Capacidad de Shannon + entropía de la fuente (todo a mano)
+│   ├── information_theory.dart        # Capacidad de Shannon + entropía de la fuente (todo a mano)
+│   └── error_correction.dart          # FEC Hamming (7,4): codifica/decodifica/corrige (todo a mano)
 ├── ui/
 │   └── ui_dashboard.dart              # Conectar (esperar/buscar), mic, métricas, gráfica
 └── utils/
@@ -181,6 +186,8 @@ python_dsp/
 - `[0xCC, 0xEE, ID_HI, ID_LO, byteLen(u32), txEpochMs(u64), ...]` — Cabecera de ráfaga
 - `[0xCD, 0xEF, ID_HI, ID_LO, txEpochMs(u64), rxEpochMs(u64)]` — ACK de ráfaga (20 B — más corto
   que los demás; el framing de recepción calcula el tamaño esperado según los 2 bytes de magic)
+- `[0xCD, 0xF0, ID_HI, ID_LO]` — NACK: solicitud de reenvío de la ráfaga `ID` (4 B, ARQ — ver
+  sección "Optimizar señal")
 - `[0xFF, 0xFF, 0xEE, 0xDD, ...]` — Fin de stream
 
 **Detección de pérdidas:** salto en `SEQ` → `perdidos = (SEQ_recibido − SEQ_esperado) mod 65536`.
@@ -230,6 +237,52 @@ falla, la app recurre a una caminata aleatoria acotada (±1 dB, clamped a
 [−95, −40] dBm) como *placeholder* visual — y la UI **marca explícitamente**
 cuál de los dos modos está activo (`ChannelMetrics.rssiIsReal`), en vez de
 presentar un dato simulado como si fuera real.
+
+### Panel "Optimizar señal" — de crudo a optimizado, sintiendo la diferencia
+
+Analizar el canal no es lo mismo que mejorarlo. Cada sesión arranca **cruda**
+(`SignalOptimizationSettings.raw`: las 5 mitigaciones apagadas) para poder
+escuchar primero el canal tal como llega, y el panel "Optimizar señal" del
+dashboard deja activarlas en vivo — el cambio se siente de inmediato, sin
+reconectar, porque `BluetoothManager.signalSettings` se relee en cada
+paquete/chunk:
+
+- **Switch maestro:** todo crudo ↔ todo optimizado, para la demo rápida.
+- **"Personalizar" (colapsado por defecto):** 5 switches individuales — PLC,
+  Filtro IIR/FIR, AEC, FEC y ARQ — para poder medir en el informe cuánto
+  aporta CADA técnica por separado, sin abrumar al usuario promedio con 5
+  controles a la vista todo el tiempo.
+
+| Mitigación | Con el switch apagado se oye/pasa… | Encendido… |
+|---|---|---|
+| PLC | Silencio/gap crudo en cada paquete perdido | Repetición atenuada (−3 dB/repetición) |
+| Filtro IIR/FIR | El ruido AWGN inyectado (RSSI débil) sin limpiar | Ruido filtrado (~40 dB/octava) |
+| AEC | Full-dúplex sin cancelar — eco propio audible sin auriculares | Semi-dúplex + NLMS residual |
+| FEC (Hamming 7,4) | Bits corrompidos simulados tal cual (clics/pops) | Bits corregidos automáticamente |
+| ARQ | El hueco de pérdida se queda como tal (más allá de lo que PLC repuso) | Ráfaga completa reenviada a pedido |
+
+**Nota importante de honestidad metodológica:** el ruido AWGN y los
+bit-errores que corrige el FEC **siempre** se inyectan cuando el RSSI cae
+bajo el umbral débil — representan al CANAL degradado, no a una
+optimización. Lo que cada switch enciende/apaga es si esa degradación se
+**limpia/corrige** o se deja pasar tal cual. Esto es deliberado: Bluetooth
+Clásico (RFCOMM sobre L2CAP) ya protege el enlace contra corrupción de bits
+a nivel físico, así que en la práctica casi nunca llega un bit volteado
+hasta la capa de aplicación — sin esta simulación, el FEC no tendría nada
+que corregir y el switch no se sentiría. La pérdida de paquetes real, en
+cambio, sí ocurre de forma genuina (desbordamiento del Jitter Buffer,
+interrupciones del enlace), así que el ARQ actúa sobre pérdidas reales, no
+simuladas.
+
+**Cómo funciona el ARQ sin arriesgar el Jitter Buffer ya probado:** en vez de
+reinsertar el paquete recuperado en su posición exacta dentro del buffer
+circular (que ya jugó su parte con PLC para ese hueco), el paquete
+retransmitido se reproduce como un clip corto adicional, apenas llega —
+simple y no toca la lógica de temporización del Jitter Buffer que costó
+varias iteraciones dejar estable (ver Dificultades §4-5). El costo real: el
+audio recuperado puede sonar un poco fuera de orden/con retraso — un
+trade-off genuino de ARQ sobre un canal con latencia, no una simplificación
+que se esconda.
 
 ### Ráfagas de voz y latencia
 
@@ -341,9 +394,12 @@ En cada teléfono, sobre su propio enlace de recepción:
 - **Paquetes recibidos/perdidos** — contadores absolutos.
 - **Capacidad de canal C [kbps]** y **entropía de la fuente H(X) [bits/muestra]**
   — recalculadas tras cada clip reproducido (panel "Teoría de la Información").
+- **Paquetes recuperados por ARQ** — cuántos de los detectados como perdidos
+  se recuperaron por retransmisión (subconjunto de `packetsLost`).
 - **Log de algoritmos en vivo** — traza con marca de tiempo de cada evento de
-  PLC (paquetes repuestos), AEC (silenciado/reactivado del micrófono) y
-  AWGN+filtro (activados cuando el RSSI cae bajo el umbral débil).
+  PLC (paquetes repuestos), AEC (silenciado/reactivado del micrófono), FEC
+  (bits corregidos por Hamming), ARQ (solicitudes/reenvíos) y AWGN+filtro
+  (activados cuando el RSSI cae bajo el umbral débil).
 
 Análisis esperado para el informe: correlación RSSI ↓ ⇒ pérdida ↑ al aumentar
 la distancia/obstáculos; efectividad del PLC (continuidad perceptual pese a
@@ -400,7 +456,14 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    ida con exactitud. Solución: protocolo de ACK — el emisor mide RTT con su
    propio reloj (metrológicamente honesto); el tránsito del receptor se
    reporta con su salvedad.
-9. **El RSSI mostrado SIEMPRE bajaba, nunca subía.** La simulación de
+9. **¿Cómo demostrar FEC si Bluetooth Clásico ya casi no deja pasar bits
+   corruptos?** RFCOMM/L2CAP protege el enlace a nivel físico, así que un
+   Hamming(7,4) real casi nunca tendría algo que corregir en la práctica —
+   el switch se sentiría "muerto". Solución: simular una tasa de bit-error
+   propia (igual patrón que el AWGN ya existente), proporcional a la
+   degradación de RSSI, documentado explícitamente como una simulación
+   pedagógica y no una medición del canal físico real.
+10. **El RSSI mostrado SIEMPRE bajaba, nunca subía.** La simulación de
    respaldo tenía un sesgo: `_currentRssi += (_currentRssi > -90 ? -0.5 : 0.5)`
    restaba en casi cualquier valor razonable (la condición era casi siempre
    cierta), así que el valor solo podía caer hasta el piso. Además el lado
@@ -436,8 +499,11 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    acoplamiento acústico cambia con la posición del teléfono — de ahí la
    necesidad de un filtro ADAPTATIVO, el mismo principio de Cap. II llevado a
    coeficientes variables en el tiempo.
-7. Mejora futura alineada al curso: añadir un código detector/corrector
-   simple por paquete (paridad o Hamming) para enlazar con Cap. V.
+7. El código detector/corrector (Hamming 7,4, Cap. V) y el ARQ por NACK se
+   implementaron y son ACTIVABLES en vivo desde el panel "Optimizar señal",
+   junto a PLC/Filtro/AEC — el proyecto pasó de solo MEDIR la degradación del
+   canal a también poder MITIGARLA a demanda, comparando "antes" y "después"
+   sin reconectar.
 
 ---
 

@@ -87,6 +87,38 @@ class AppState extends ChangeNotifier {
   final List<String> _algorithmLog = [];
   List<String> get algorithmLog => List.unmodifiable(_algorithmLog);
 
+  // ── Panel "Optimizar señal": crudo por defecto, se activa a demanda ──────
+  SignalOptimizationSettings _signalSettings = SignalOptimizationSettings.raw;
+  SignalOptimizationSettings get signalSettings => _signalSettings;
+
+  /// Switch maestro: enciende o apaga TODAS las mitigaciones a la vez.
+  void setSignalOptimizationEnabled(bool enabled) {
+    _signalSettings = enabled
+        ? SignalOptimizationSettings.optimized
+        : SignalOptimizationSettings.raw;
+    btManager.signalSettings = _signalSettings;
+    notifyListeners();
+  }
+
+  /// Panel "Personalizar": ajusta una mitigación puntual sin tocar las demás.
+  void setIndividualOptimization({
+    bool? plc,
+    bool? filter,
+    bool? aec,
+    bool? fec,
+    bool? arq,
+  }) {
+    _signalSettings = _signalSettings.copyWith(
+      plcEnabled: plc,
+      filterEnabled: filter,
+      aecEnabled: aec,
+      fecEnabled: fec,
+      arqEnabled: arq,
+    );
+    btManager.signalSettings = _signalSettings;
+    notifyListeners();
+  }
+
   // ── Latencias por ráfaga (insumos para el informe) ───────────────────────
   double? _lastLatencyMs;
   double _latencySumMs = 0;
@@ -335,6 +367,10 @@ class AppState extends ChangeNotifier {
     _burstCount = 0;
     _algorithmLog.clear();
     _infoTheory = null;
+    // Cada sesión arranca en "crudo" (todo apagado) — se activa a demanda
+    // desde el panel "Optimizar señal" para poder sentir la diferencia.
+    _signalSettings = SignalOptimizationSettings.raw;
+    btManager.signalSettings = _signalSettings;
     _isActive = true;
     notifyListeners();
     _listenToStreams();

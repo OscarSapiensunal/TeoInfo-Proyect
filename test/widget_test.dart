@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dsp_bt_analyzer/models/app_models.dart';
 import 'package:dsp_bt_analyzer/dsp/dsp_processor.dart';
+import 'package:dsp_bt_analyzer/dsp/error_correction.dart';
 
 void main() {
   test('Paquete de datos: build + parse de secuencia', () {
@@ -65,7 +66,14 @@ void main() {
 
     final block = Uint8List.fromList(List.filled(kPayloadSize, 0x11));
     for (int i = 0; i < 5; i++) {
-      dsp.processBlock(rawBlock: block, rssiDbm: -60.0, isLost: false);
+      dsp.processBlock(
+        rawBlock: block,
+        rssiDbm: -60.0,
+        isLost: false,
+        plcEnabled: false,
+        filterEnabled: false,
+        fecEnabled: false,
+      );
     }
 
     // El buffer debe reflejar los 5 bloques encolados, no drenarse solo.
@@ -84,11 +92,43 @@ void main() {
     final dsp = DspProcessor();
     for (int i = 0; i < kJitterBufferCapacity + 3; i++) {
       final block = Uint8List(kPayloadSize)..[0] = i & 0xFF;
-      dsp.processBlock(rawBlock: block, rssiDbm: -60.0, isLost: false);
+      dsp.processBlock(
+        rawBlock: block,
+        rssiDbm: -60.0,
+        isLost: false,
+        plcEnabled: false,
+        filterEnabled: false,
+        fecEnabled: false,
+      );
     }
     expect(dsp.jitterBuffer.size, kJitterBufferCapacity);
     expect(dsp.jitterBuffer.isFull, isTrue);
     // Los 3 primeros bloques (índices 0,1,2) fueron descartados por overflow.
     expect(dsp.jitterBuffer.pop()!.first, 3);
+  });
+
+  test('Hamming (7,4): codifica y decodifica sin corrupción', () {
+    final data = Uint8List.fromList([0x00, 0xFF, 0xA5, 0x3C, 0x91]);
+    final encoded = HammingCodec.encode(data);
+    expect(encoded.length, data.length * 2);
+
+    final decoded = HammingCodec.decode(encoded);
+    expect(decoded.data, equals(data));
+    expect(decoded.correctedBits, 0);
+  });
+
+  test('Hamming (7,4): corrige un bit volteado por cada byte codificado', () {
+    final data = Uint8List.fromList([0x5A]);
+    final encoded = HammingCodec.encode(data);
+
+    // Voltea el bit 3 (posición arbitraria dentro de los 7 útiles) de cada
+    // uno de los 2 bytes codificados (uno por nibble).
+    final corrupted = Uint8List.fromList(encoded);
+    corrupted[0] ^= (1 << 3);
+    corrupted[1] ^= (1 << 5);
+
+    final decoded = HammingCodec.decode(corrupted);
+    expect(decoded.data, equals(data));
+    expect(decoded.correctedBits, 2);
   });
 }

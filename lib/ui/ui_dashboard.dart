@@ -62,6 +62,8 @@ class UiDashboard extends StatelessWidget {
               SizedBox(height: 12),
               _ConnectCard(),
               SizedBox(height: 12),
+              _SignalOptimizationCard(),
+              SizedBox(height: 12),
               _LatencyCard(),
               SizedBox(height: 12),
               _MetricsPanelCard(),
@@ -487,6 +489,148 @@ class _DeviceTile extends StatelessWidget {
             const Icon(Icons.chevron_right_rounded, size: 18, color: _C.textMuted),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPTIMIZAR SEÑAL — switch maestro (crudo/optimizado) + panel personalizado
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SignalOptimizationCard extends StatelessWidget {
+  const _SignalOptimizationCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.isActive) return const SizedBox.shrink();
+
+    final s = state.signalSettings;
+    final String subtitle;
+    if (s.allEnabled) {
+      subtitle = 'Optimizada: las 5 mitigaciones activas';
+    } else if (s.allDisabled) {
+      subtitle = 'Cruda: sin ninguna mitigación (así llega el canal real)';
+    } else {
+      final active = [
+        s.plcEnabled,
+        s.filterEnabled,
+        s.aecEnabled,
+        s.fecEnabled,
+        s.arqEnabled,
+      ].where((v) => v).length;
+      subtitle = 'Personalizado: $active/5 mitigaciones activas';
+    }
+
+    return _Card(
+      title: 'OPTIMIZAR SEÑAL',
+      icon: Icons.tune_rounded,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  subtitle,
+                  style: const TextStyle(color: _C.textMuted, fontSize: 12),
+                ),
+              ),
+              Switch(
+                value: s.allEnabled,
+                activeThumbColor: _C.accentGreen,
+                onChanged: state.setSignalOptimizationEnabled,
+              ),
+            ],
+          ),
+          if (state.metrics.packetsRecovered > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+              'ARQ recuperó ${state.metrics.packetsRecovered} paquete(s) por retransmisión',
+              style: const TextStyle(color: _C.accentGreen, fontSize: 11),
+            ),
+          ],
+          const SizedBox(height: 4),
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              iconColor: _C.textMuted,
+              collapsedIconColor: _C.textMuted,
+              title: const Text(
+                'Personalizar',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: _C.textMuted,
+                  letterSpacing: 0.6,
+                ),
+              ),
+              children: [
+                _OptimizationSwitchRow(
+                  label: 'PLC — repone paquetes perdidos',
+                  value: s.plcEnabled,
+                  onChanged: (v) => state.setIndividualOptimization(plc: v),
+                ),
+                _OptimizationSwitchRow(
+                  label: 'Filtro IIR/FIR — limpia el ruido inyectado',
+                  value: s.filterEnabled,
+                  onChanged: (v) => state.setIndividualOptimization(filter: v),
+                ),
+                _OptimizationSwitchRow(
+                  label: 'AEC — cancela el eco acústico propio',
+                  value: s.aecEnabled,
+                  onChanged: (v) => state.setIndividualOptimization(aec: v),
+                ),
+                _OptimizationSwitchRow(
+                  label: 'FEC (Hamming 7,4) — corrige bits corruptos',
+                  value: s.fecEnabled,
+                  onChanged: (v) => state.setIndividualOptimization(fec: v),
+                ),
+                _OptimizationSwitchRow(
+                  label: 'ARQ — pide reenvío de ráfagas con huecos',
+                  value: s.arqEnabled,
+                  onChanged: (v) => state.setIndividualOptimization(arq: v),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _OptimizationSwitchRow extends StatelessWidget {
+  final String label;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  const _OptimizationSwitchRow({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(color: _C.textPrimary, fontSize: 12),
+            ),
+          ),
+          Switch(
+            value: value,
+            activeThumbColor: _C.accent,
+            onChanged: onChanged,
+          ),
+        ],
       ),
     );
   }

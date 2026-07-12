@@ -84,6 +84,20 @@ class BluetoothManager {
   bool Function()? isSpeakerActive;
   bool _wasGatingMic = false;
 
+  /// Mitigaciones de canal activas en vivo (panel "Optimizar señal" de la
+  /// UI). AppState lo reasigna directamente; se lee de nuevo en cada
+  /// paquete/chunk, así que un cambio en la UI se siente de inmediato sin
+  /// reiniciar la sesión. Arranca en [SignalOptimizationSettings.raw]
+  /// (todo apagado) para poder escuchar primero la señal cruda.
+  SignalOptimizationSettings signalSettings = SignalOptimizationSettings.raw;
+
+  // ── Estado de ARQ (retransmisión de ráfagas a pedido) ─────────────────────
+  Uint8List? _lastSentBurstPcm;
+  int? _lastSentBurstId;
+  int? _lastSentBurstStartSeq;
+  final Set<int> _lostSeqsInCurrentBurst = {};
+  int _totalPacketsRecovered = 0;
+
   // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
   int _rxSampleRate = kMicSampleRate;
   int _rxNumChannels = kMicNumChannels;
@@ -418,6 +432,15 @@ class BluetoothManager {
   ///     lo que se reprodujo recientemente (colas de reverberación,
   ///     transiciones justo al dejar de estar en semi-dúplex).
   void _onPcmChunk(Uint8List chunk) {
+    if (!signalSettings.aecEnabled) {
+      // AEC apagado: full-dúplex sin gating ni NLMS — el eco acústico propio
+      // (si no hay auriculares) se escucha tal cual, sin ninguna mitigación.
+      _wasGatingMic = false;
+      _burstBuilder.add(chunk);
+      _flushReadyBursts();
+      return;
+    }
+
     final bool speakerActive = isSpeakerActive?.call() ?? false;
     if (speakerActive) {
       if (!_wasGatingMic) {
@@ -435,6 +458,11 @@ class BluetoothManager {
 
     final Uint8List cleaned = _aec.process(chunk);
     _burstBuilder.add(cleaned);
+    _flushReadyBursts();
+  }
+
+  /// Extrae y envía cada ráfaga completa acumulada en [_burstBuilder].
+  void _flushReadyBursts() {
     while (_burstBuilder.length >= kBurstPcmBytes) {
       final all = _burstBuilder.takeBytes();
       final burst = Uint8List.sublistView(all, 0, kBurstPcmBytes);
@@ -461,6 +489,13 @@ class BluetoothManager {
       txEpochMs: txEpochMs,
     ));
 
+    // ARQ: se cachea la ráfaga completa (pcm + SEQ inicial) por si el
+    // receptor pide reenvío — el emisor solo guarda la ÚLTIMA, es
+    // best-effort (si ya empezó la siguiente, la solicitud llega tarde).
+    _lastSentBurstId = burstId;
+    _lastSentBurstPcm = pcm;
+    _lastSentBurstStartSeq = _txSeq;
+
     int offset = 0;
     int packets = 0;
     while (offset < pcm.length) {
@@ -478,6 +513,26 @@ class BluetoothManager {
     final int sendMs = DateTime.now().millisecondsSinceEpoch - txEpochMs;
     _log.i(
         'TX ráfaga #$burstId: ${pcm.length} B en $packets paquetes ($sendMs ms)');
+  }
+
+  /// ARQ: reenvía todos los paquetes de datos de una ráfaga previamente
+  /// cacheada (sin repetir su cabecera — el receptor ya la tiene), usando
+  /// los MISMOS números de secuencia originales para que el receptor pueda
+  /// reconciliarlos con los que marcó como perdidos.
+  Future<void> _resendBurstPackets(int burstId, Uint8List pcm, int startSeq) async {
+    int seq = startSeq;
+    int offset = 0;
+    while (offset < pcm.length) {
+      final int end = (offset + kPayloadSize).clamp(0, pcm.length);
+      Uint8List payload = Uint8List.sublistView(pcm, offset, end);
+      if (payload.length < kPayloadSize) {
+        payload = Uint8List(kPayloadSize)..setRange(0, end - offset, payload);
+      }
+      await _txWrite(buildPacket(seq & 0xFFFF, payload));
+      seq++;
+      offset += kPayloadSize;
+    }
+    _log.i('ARQ: reenviada ráfaga #$burstId completa a pedido del receptor');
   }
 
   /// Escritura unificada de TX: servidor nativo (anfitrión) o socket cliente.
@@ -593,6 +648,7 @@ class BluetoothManager {
   /// es más corto (20 B) que el resto de tipos (kPacketSize, 1024 B).
   int _expectedPacketLength(int b0, int b1) {
     if (b0 == kAckMagic0 && b1 == kAckMagic1) return kAckPacketSize;
+    if (b0 == kNackMagic0 && b1 == kNackMagic1) return kNackPacketSize;
     return kPacketSize;
   }
 
@@ -636,6 +692,7 @@ class BluetoothManager {
           (b0 == 0xCC && b1 == 0xDD) || // meta-paquete audio
           (b0 == kBurstMagic0 && b1 == kBurstMagic1) || // cabecera de ráfaga
           (b0 == kAckMagic0 && b1 == kAckMagic1) || // ACK de ráfaga
+          (b0 == kNackMagic0 && b1 == kNackMagic1) || // NACK (solicitud ARQ)
           (b0 == 0xFF && b1 == 0xFF)) {
         // fin de stream
         return i;
@@ -682,8 +739,33 @@ class BluetoothManager {
       _rxBurstId = header.burstId;
       _rxBurstTxEpochMs = header.txEpochMs;
       _rxBurstBytesRemaining = header.pcmByteLength;
+      // Ventana de gracia para retransmisiones ARQ de la ráfaga ANTERIOR:
+      // se limpia recién cuando empieza la siguiente, no al completar ésta,
+      // para darle al NACK+reenvío tiempo de llegar aunque sea tarde.
+      _lostSeqsInCurrentBurst.clear();
       _log.i('RX cabecera ráfaga #${header.burstId}: '
           '${header.pcmByteLength} B esperados');
+      return;
+    }
+
+    // ── NACK: el otro lado pide reenvío de una ráfaga que él transmitió ──
+    if (b0 == kNackMagic0 && b1 == kNackMagic1) {
+      final req = NackRequest.parse(packet);
+      if (_lastSentBurstId == req.burstId &&
+          _lastSentBurstPcm != null &&
+          _lastSentBurstStartSeq != null) {
+        _algorithmLogController.add(
+            'ARQ: solicitud de reenvío para ráfaga #${req.burstId} → reenviando');
+        final pcm = _lastSentBurstPcm!;
+        final startSeq = _lastSentBurstStartSeq!;
+        _sendChain = _sendChain
+            .then((_) => _resendBurstPackets(req.burstId, pcm, startSeq))
+            .catchError((Object e) {
+          _log.w('ARQ: error reenviando ráfaga #${req.burstId}: $e');
+        });
+      } else {
+        _log.d('ARQ: ráfaga #${req.burstId} ya no está en caché, se ignora');
+      }
       return;
     }
 
@@ -704,6 +786,31 @@ class BluetoothManager {
     final int seqNum = parseSequenceNumber(packet);
     if (seqNum == -1) return;
 
+    // ── ARQ: ¿es la retransmisión tardía de un paquete ya marcado perdido? ──
+    // Un SEQ "atrasado" respecto al último aceptado, dentro de la ventana de
+    // pérdidas recientes, no es un paquete nuevo — es la respuesta a un NACK.
+    // Se recupera SIN tocar el Jitter Buffer/PLC (ya jugaron su parte para
+    // ese hueco): se manda directo a reproducción como un clip corto extra.
+    if (_lastSequenceNumber != -1) {
+      final int backDistance = (_lastSequenceNumber - seqNum) & 0xFFFF;
+      if (backDistance > 0 && backDistance <= kMaxConsecutiveLostPackets) {
+        if (_lostSeqsInCurrentBurst.remove(seqNum)) {
+          _totalPacketsRecovered++;
+          _totalPacketsLost = (_totalPacketsLost - 1).clamp(0, 1 << 30);
+          final recovered = Uint8List.fromList(
+              Uint8List.sublistView(packet, 4, kPacketSize));
+          _audioChunkController.add(recovered);
+          _algorithmLogController
+              .add('ARQ: paquete SEQ=$seqNum recuperado por retransmisión');
+          _metricsController.add(currentMetrics);
+        } else {
+          _log.d('Paquete SEQ=$seqNum ignorado (duplicado o fuera de '
+              'ventana ARQ)');
+        }
+        return;
+      }
+    }
+
     // ── Detección de paquetes perdidos por saltos en secuencia ───────────
     int lostInGap = 0;
     if (_lastSequenceNumber != -1) {
@@ -720,11 +827,26 @@ class BluetoothManager {
             'PLC: $lostInGap paquete(s) perdido(s) → repetición atenuada '
             '(-3 dB por repetición)');
 
+        if (signalSettings.arqEnabled && _rxBurstId != null) {
+          for (int i = 0; i < lostInGap; i++) {
+            _lostSeqsInCurrentBurst.add((expected + i) & 0xFFFF);
+          }
+          _algorithmLogController
+              .add('ARQ: solicitando reenvío de la ráfaga #$_rxBurstId');
+          unawaited(_txWrite(buildNackPacket(burstId: _rxBurstId!))
+              .catchError((Object e) {
+            _log.w('No se pudo enviar NACK: $e');
+          }));
+        }
+
         for (int i = 0; i < lostInGap; i++) {
           _dsp.processBlock(
             rawBlock: null,
             rssiDbm: _currentRssi,
             isLost: true,
+            plcEnabled: signalSettings.plcEnabled,
+            filterEnabled: signalSettings.filterEnabled,
+            fecEnabled: signalSettings.fecEnabled,
             numChannels: _rxNumChannels,
             bitsPerSample: _rxBitsPerSample,
           );
@@ -742,9 +864,17 @@ class BluetoothManager {
       rawBlock: payload,
       rssiDbm: _currentRssi,
       isLost: false,
+      plcEnabled: signalSettings.plcEnabled,
+      filterEnabled: signalSettings.filterEnabled,
+      fecEnabled: signalSettings.fecEnabled,
       numChannels: _rxNumChannels,
       bitsPerSample: _rxBitsPerSample,
     );
+    if (_dsp.lastFecCorrectedBits > 0) {
+      _algorithmLogController.add(
+          'FEC (Hamming 7,4): ${_dsp.lastFecCorrectedBits} bit(s) '
+          'corregidos automáticamente');
+    }
     _consumeBurstBytes(kPayloadSize);
 
     // ── Emitir métricas actualizadas ─────────────────────────────────────
@@ -759,6 +889,7 @@ class BluetoothManager {
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
       packetsLost: _totalPacketsLost,
+      packetsRecovered: _totalPacketsRecovered,
       timestamp: DateTime.now(),
     ));
   }
@@ -920,6 +1051,8 @@ class BluetoothManager {
     _lastSequenceNumber = -1;
     _totalPacketsReceived = 0;
     _totalPacketsLost = 0;
+    _totalPacketsRecovered = 0;
+    _lostSeqsInCurrentBurst.clear();
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
     _rxBurstBytesRemaining = 0;
@@ -933,6 +1066,9 @@ class BluetoothManager {
     _sendChain = Future.value();
     _aec.reset();
     _wasGatingMic = false;
+    _lastSentBurstPcm = null;
+    _lastSentBurstId = null;
+    _lastSentBurstStartSeq = null;
   }
 
   /// Detiene la transmisión/recepción y cierra la conexión.
@@ -992,6 +1128,7 @@ class BluetoothManager {
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
       packetsLost: _totalPacketsLost,
+      packetsRecovered: _totalPacketsRecovered,
       timestamp: DateTime.now(),
     );
   }

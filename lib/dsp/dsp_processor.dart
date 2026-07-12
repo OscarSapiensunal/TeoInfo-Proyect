@@ -15,6 +15,7 @@ import 'dart:typed_data';
 import 'package:logger/logger.dart';
 
 import '../models/app_models.dart';
+import 'error_correction.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTES DSP
@@ -51,6 +52,12 @@ const double kIirAlpha = 0.15;
 
 /// Orden del filtro de promedio móvil (FIR) para segunda pasada.
 const int kMovingAvgOrder = 5;
+
+/// Tasa MÁXIMA de bit-error simulada (por bit) para el demo de FEC, alcanzada
+/// en el peor caso de degradación de RSSI. Bluetooth Clásico ya protege el
+/// enlace contra esto a nivel físico; se simula aquí para poder enseñar y
+/// medir Hamming (7,4) — ver error_correction.dart.
+const double kFecMaxBitErrorRate = 0.03;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JITTER BUFFER CIRCULAR
@@ -144,6 +151,13 @@ class DspProcessor {
   // ── Jitter Buffer ────────────────────────────────────────────────────────
   final JitterBuffer jitterBuffer = JitterBuffer();
 
+  /// Cuántos bits corrigió Hamming en el último bloque procesado (0 si FEC no
+  /// se activó para ese bloque). `BluetoothManager` lo lee justo después de
+  /// llamar a [processBlock] para decidir si emite una línea al log de
+  /// algoritmos — evita tener que cambiar `processBlock` a un tipo de retorno
+  /// más complejo por un solo dato informativo.
+  int lastFecCorrectedBits = 0;
+
   // ─────────────────────────────────────────────────────────────────────────
   // API PÚBLICA
   // ─────────────────────────────────────────────────────────────────────────
@@ -155,6 +169,11 @@ class DspProcessor {
   /// - [rawBlock]  : bytes crudos del payload del paquete (PCM Int16 LE).
   /// - [rssiDbm]   : RSSI actual en dBm.
   /// - [isLost]    : true si este bloque fue inferido como perdido (PLC trigger).
+  /// - [plcEnabled]/[filterEnabled]/[fecEnabled]: toggles en vivo del panel
+  ///   "Optimizar señal" (ver SignalOptimizationSettings). El ruido AWGN NO
+  ///   se gatea por ningún toggle: representa el canal degradado en sí, no
+  ///   una mitigación — lo que se activa/desactiva es si se LIMPIA (filtro)
+  ///   o se CORRIGE (FEC).
   /// - [numChannels] y [bitsPerSample]: parámetros del stream de audio en curso.
   ///
   /// No retorna el bloque directamente: la extracción del Jitter Buffer la
@@ -164,21 +183,39 @@ class DspProcessor {
     required Uint8List? rawBlock,
     required double rssiDbm,
     required bool isLost,
+    required bool plcEnabled,
+    required bool filterEnabled,
+    required bool fecEnabled,
     int numChannels = 1,
     int bitsPerSample = 16,
   }) {
     Uint8List workBlock;
+    lastFecCorrectedBits = 0;
 
-    // ── 1. Packet Loss Concealment ──────────────────────────────────────────
+    // ── 1. Packet Loss Concealment (si está apagado: silencio crudo) ────────
     if (isLost || rawBlock == null) {
-      workBlock = _applyPlc(numChannels: numChannels, bitsPerSample: bitsPerSample);
+      workBlock = _applyPlc(
+        enabled: plcEnabled,
+        numChannels: numChannels,
+        bitsPerSample: bitsPerSample,
+      );
     } else {
       workBlock = Uint8List.fromList(rawBlock); // copia defensiva
-      _lastValidBlock = Uint8List.fromList(rawBlock);
+
+      // ── 1b. FEC (Hamming 7,4) sobre bit-errores simulados ────────────────
+      if (rssiDbm < kRssiWeakThreshold && bitsPerSample == 16) {
+        workBlock = _applyFec(
+          block: workBlock,
+          rssiDbm: rssiDbm,
+          fecEnabled: fecEnabled,
+        );
+      }
+
+      _lastValidBlock = Uint8List.fromList(workBlock);
       _plcRepeatCount = 0;
     }
 
-    // ── 2. Inyección de ruido AWGN (señal débil) ────────────────────────────
+    // ── 2. Inyección de ruido AWGN (señal débil) — siempre activa ───────────
     if (rssiDbm < kRssiWeakThreshold && bitsPerSample == 16) {
       workBlock = _injectAwgnNoise(
         block: workBlock,
@@ -187,8 +224,8 @@ class DspProcessor {
       );
     }
 
-    // ── 3. Filtro digital paso-bajos (reducción de ruido de alta frecuencia) ─
-    if (rssiDbm < kRssiWeakThreshold && bitsPerSample == 16) {
+    // ── 3. Filtro digital paso-bajos (solo si está activado) ────────────────
+    if (filterEnabled && rssiDbm < kRssiWeakThreshold && bitsPerSample == 16) {
       workBlock = _applyLowPassFilter(
         block: workBlock,
         numChannels: numChannels,
@@ -200,19 +237,61 @@ class DspProcessor {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // FEC — HAMMING (7,4) SOBRE BIT-ERRORES SIMULADOS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Simula una tasa de bit-error proporcional a la degradación del RSSI y,
+  /// según [fecEnabled], corrige esos bits con Hamming (7,4) o los deja
+  /// corrompidos — ver error_correction.dart para el porqué de simular en
+  /// vez de depender de corrupción real (rara sobre RFCOMM).
+  Uint8List _applyFec({
+    required Uint8List block,
+    required double rssiDbm,
+    required bool fecEnabled,
+  }) {
+    final double degradation = (kRssiWeakThreshold - rssiDbm).clamp(0.0, 30.0);
+    final double bitErrorRate = kFecMaxBitErrorRate * (degradation / 30.0);
+    if (bitErrorRate <= 0) return block;
+
+    if (!fecEnabled) {
+      return HammingCodec.simulateBitErrors(block, bitErrorRate, _rng);
+    }
+
+    final encoded = HammingCodec.encode(block);
+    final corrupted = HammingCodec.simulateBitErrors(encoded, bitErrorRate, _rng);
+    final decoded = HammingCodec.decode(corrupted);
+    lastFecCorrectedBits = decoded.correctedBits;
+    if (decoded.correctedBits > 0) {
+      _log.d('FEC: ${decoded.correctedBits} bit(s) corregidos (Hamming 7,4)');
+    }
+    return decoded.data;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // PACKET LOSS CONCEALMENT (PLC)
   // ─────────────────────────────────────────────────────────────────────────
 
   /// Genera un bloque de sustitución cuando se detecta pérdida de paquete.
   ///
   /// Algoritmo:
+  ///   - Si [enabled] es false: silencio crudo, sin concealment — el hueco
+  ///     de pérdida se escucha tal cual (gap/clic), que es justo el punto de
+  ///     comparación del panel "Optimizar señal".
   ///   - Si hay bloque previo: repite con atenuación exponencial de 3 dB/repetición.
   ///   - Si no hay bloque previo: genera silencio (relleno con ceros).
   ///
   /// La atenuación previene artefactos perceptuales al cortar abruptamente.
-  Uint8List _applyPlc({required int numChannels, required int bitsPerSample}) {
-    _plcRepeatCount++;
+  Uint8List _applyPlc({
+    required bool enabled,
+    required int numChannels,
+    required int bitsPerSample,
+  }) {
     final int blockSize = kPayloadSize; // bytes
+    if (!enabled) {
+      return Uint8List(blockSize);
+    }
+
+    _plcRepeatCount++;
 
     if (_lastValidBlock == null) {
       _log.d('PLC: sin bloque previo → silencio');
