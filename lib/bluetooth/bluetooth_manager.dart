@@ -26,6 +26,7 @@ import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:logger/logger.dart';
 
 import '../models/app_models.dart';
+import '../dsp/companding.dart';
 import '../dsp/dsp_processor.dart';
 import '../dsp/echo_canceller.dart';
 import '../dsp/information_theory.dart';
@@ -46,9 +47,10 @@ const int kPacketIntervalMs = 11;
 const int kRssiPollIntervalMs = 2000;
 
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo.
-/// DEBE cubrir al menos 2 ráfagas completas (63 paquetes c/u): una ráfaga
-/// entera puede perderse de golpe, y con un tope menor que eso el conteo
-/// además rompe la ventana del ARQ (ver kArqRecoveryWindowPackets).
+/// DEBE cubrir al menos 2 ráfagas completas: una ráfaga entera puede
+/// perderse de golpe, y con un tope menor que eso el conteo además rompe la
+/// ventana del ARQ (ver kArqRecoveryWindowPackets). Con μ-law una ráfaga
+/// son 16 paquetes de aire, así que 126 cubre con margen de sobra.
 const int kMaxConsecutiveLostPackets = 126;
 
 /// Ventana hacia atrás (en números de secuencia) dentro de la cual un
@@ -138,6 +140,19 @@ class BluetoothManager {
   int _rxSampleRate = kMicSampleRate;
   int _rxNumChannels = kMicNumChannels;
   int _rxBitsPerSample = kMicBitsPerSample;
+
+  /// true si el stream entrante viene comprimido con μ-law (modo voz);
+  /// false si es PCM lineal tal cual (modo laboratorio .wav). Lo anuncia el
+  /// emisor en el byte 8 del meta-paquete.
+  bool _rxIsMuLaw = false;
+
+  /// Tamaño de un bloque DESPUÉS de decodificar: el payload al aire siempre
+  /// es de [kPayloadSize] bytes, pero si viene en μ-law se expande al doble
+  /// de bytes de PCM lineal — el PLC necesita generar bloques de sustitución
+  /// de ese mismo tamaño para que el reloj de reproducción no se desfase.
+  int get _rxBlockSizeDecoded =>
+      _rxIsMuLaw ? kPayloadSize * 2 : kPayloadSize;
+
   void Function(int sr, int nc, int bps)? _onWavInfoCallback;
 
   /// Agrupa el Jitter Buffer en clips discretos para reproducción (ver
@@ -313,6 +328,7 @@ class BluetoothManager {
                   sampleRate: wavHeader.sampleRate,
                   numChannels: wavHeader.numChannels,
                   bitsPerSample: wavHeader.bitsPerSample,
+                  codec: kCodecPcm16, // el .wav viaja lineal, sin companding
                 );
                 unawaited(_transmitWav(
                     wavFilePath: wavFilePath, wavHeader: wavHeader));
@@ -430,6 +446,7 @@ class BluetoothManager {
           sampleRate: kMicSampleRate,
           numChannels: kMicNumChannels,
           bitsPerSample: kMicBitsPerSample,
+          codec: kCodecMuLaw, // la voz viaja comprimida (G.711 μ-law)
         );
         final pcmStream = await _capture.startCapture();
         _pcmSub = pcmStream.listen(
@@ -551,28 +568,38 @@ class BluetoothManager {
   }
 
   /// Envía una ráfaga completa: cabecera con timestamp + paquetes de datos.
+  ///
+  /// El PCM lineal se comprime a μ-law ANTES de salir al aire (adaptación
+  /// de la tasa de la fuente a la capacidad del canal — ver companding.dart):
+  /// una ráfaga de 2 s pasa de 32000 B a 16000 B (16 paquetes).
   Future<void> _sendBurst(int burstId, Uint8List pcm) async {
+    final Uint8List wire = MuLawCodec.encode(pcm);
+
     final int txEpochMs = DateTime.now().millisecondsSinceEpoch;
     await _txWrite(buildBurstHeaderPacket(
       burstId: burstId,
-      pcmByteLength: pcm.length,
+      pcmByteLength: wire.length,
       txEpochMs: txEpochMs,
     ));
 
-    // ARQ: se cachea la ráfaga completa (pcm + SEQ inicial) por si el
-    // receptor pide reenvío — el emisor solo guarda la ÚLTIMA, es
-    // best-effort (si ya empezó la siguiente, la solicitud llega tarde).
+    // ARQ: se cachea la ráfaga YA CODIFICADA (bytes de aire + SEQ inicial)
+    // por si el receptor pide reenvío — el emisor solo guarda la ÚLTIMA,
+    // es best-effort (si ya empezó la siguiente, la solicitud llega tarde).
     _lastSentBurstId = burstId;
-    _lastSentBurstPcm = pcm;
+    _lastSentBurstPcm = wire;
     _lastSentBurstStartSeq = _txSeq;
 
     int offset = 0;
     int packets = 0;
-    while (offset < pcm.length) {
-      final int end = (offset + kPayloadSize).clamp(0, pcm.length);
-      Uint8List payload = Uint8List.sublistView(pcm, offset, end);
+    while (offset < wire.length) {
+      final int end = (offset + kPayloadSize).clamp(0, wire.length);
+      Uint8List payload = Uint8List.sublistView(wire, offset, end);
       if (payload.length < kPayloadSize) {
-        payload = Uint8List(kPayloadSize)..setRange(0, end - offset, payload);
+        // Relleno con SILENCIO μ-law (0xFF), no con ceros binarios: 0x00 en
+        // μ-law decodifica a casi fondo de escala y sonaría como un clic.
+        payload = Uint8List(kPayloadSize)
+          ..fillRange(0, kPayloadSize, MuLawCodec.kSilenceByte)
+          ..setRange(0, end - offset, payload);
       }
       await _txWrite(buildPacket(_txSeq & 0xFFFF, payload));
       _txSeq++;
@@ -582,21 +609,23 @@ class BluetoothManager {
 
     final int sendMs = DateTime.now().millisecondsSinceEpoch - txEpochMs;
     _log.i(
-        'TX ráfaga #$burstId: ${pcm.length} B en $packets paquetes ($sendMs ms)');
+        'TX ráfaga #$burstId: ${wire.length} B μ-law en $packets paquetes ($sendMs ms)');
   }
 
   /// ARQ: reenvía todos los paquetes de datos de una ráfaga previamente
   /// cacheada (sin repetir su cabecera — el receptor ya la tiene), usando
   /// los MISMOS números de secuencia originales para que el receptor pueda
   /// reconciliarlos con los que marcó como perdidos.
-  Future<void> _resendBurstPackets(int burstId, Uint8List pcm, int startSeq) async {
+  Future<void> _resendBurstPackets(int burstId, Uint8List wire, int startSeq) async {
     int seq = startSeq;
     int offset = 0;
-    while (offset < pcm.length) {
-      final int end = (offset + kPayloadSize).clamp(0, pcm.length);
-      Uint8List payload = Uint8List.sublistView(pcm, offset, end);
+    while (offset < wire.length) {
+      final int end = (offset + kPayloadSize).clamp(0, wire.length);
+      Uint8List payload = Uint8List.sublistView(wire, offset, end);
       if (payload.length < kPayloadSize) {
-        payload = Uint8List(kPayloadSize)..setRange(0, end - offset, payload);
+        payload = Uint8List(kPayloadSize)
+          ..fillRange(0, kPayloadSize, MuLawCodec.kSilenceByte)
+          ..setRange(0, end - offset, payload);
       }
       await _txWrite(buildPacket(seq & 0xFFFF, payload));
       seq++;
@@ -673,11 +702,13 @@ class BluetoothManager {
   }
 
   /// Envía un paquete especial con los parámetros del stream de audio.
-  /// Estructura: [0xCC, 0xDD, numChannels, bitsPerSample, SR_B0..SR_B3, ...]
+  /// Estructura: [0xCC, 0xDD, numChannels, bitsPerSample, SR(u32 LE),
+  /// codec(1B: kCodecPcm16 | kCodecMuLaw), ...]
   Future<void> _sendStreamInfoPacket({
     required int sampleRate,
     required int numChannels,
     required int bitsPerSample,
+    required int codec,
   }) async {
     final meta = Uint8List(kPacketSize);
     meta[0] = 0xCC;
@@ -686,6 +717,7 @@ class BluetoothManager {
     meta[3] = bitsPerSample & 0xFF;
     final view = ByteData.sublistView(meta);
     view.setUint32(4, sampleRate, Endian.little);
+    meta[8] = codec & 0xFF;
     await _txWrite(meta);
     await Future.delayed(const Duration(milliseconds: 20));
   }
@@ -782,7 +814,9 @@ class BluetoothManager {
       final bps = packet[3];
       final view = ByteData.sublistView(packet);
       final sr = view.getUint32(4, Endian.little);
-      _log.i('Meta-paquete audio: ${sr}Hz, ${nc}ch, ${bps}bit');
+      _rxIsMuLaw = packet[8] == kCodecMuLaw;
+      _log.i('Meta-paquete audio: ${sr}Hz, ${nc}ch, ${bps}bit, '
+          'codec=${_rxIsMuLaw ? "μ-law" : "PCM16"}');
       _beginPlayback(sr, nc, bps);
       return;
     }
@@ -867,8 +901,10 @@ class BluetoothManager {
         if (_recentlyLostSeqs.remove(seqNum)) {
           _totalPacketsRecovered++;
           _totalPacketsLost = (_totalPacketsLost - 1).clamp(0, 1 << 30);
+          final recoveredWire = Uint8List.sublistView(packet, 4, kPacketSize);
           _dsp.processBlock(
-            rawBlock: Uint8List.sublistView(packet, 4, kPacketSize),
+            rawBlock:
+                _rxIsMuLaw ? MuLawCodec.decode(recoveredWire) : recoveredWire,
             rssiDbm: _effectiveRssi,
             isLost: false,
             plcEnabled: signalSettings.plcEnabled,
@@ -876,6 +912,7 @@ class BluetoothManager {
             fecEnabled: signalSettings.fecEnabled,
             numChannels: _rxNumChannels,
             bitsPerSample: _rxBitsPerSample,
+            lostBlockSize: _rxBlockSizeDecoded,
           );
           _algorithmLogController.add(
               'ARQ: paquete SEQ=$seqNum recuperado por retransmisión '
@@ -932,6 +969,7 @@ class BluetoothManager {
             fecEnabled: signalSettings.fecEnabled,
             numChannels: _rxNumChannels,
             bitsPerSample: _rxBitsPerSample,
+            lostBlockSize: _rxBlockSizeDecoded,
           );
           _consumeBurstBytes(kPayloadSize);
         }
@@ -941,8 +979,10 @@ class BluetoothManager {
     _lastSequenceNumber = seqNum;
     _totalPacketsReceived++;
 
-    // ── Extraer payload y procesar con DSP (encola en el Jitter Buffer) ──
-    final payload = Uint8List.sublistView(packet, 4, kPacketSize);
+    // ── Extraer payload, expandir μ-law → PCM y procesar con DSP ─────────
+    final wirePayload = Uint8List.sublistView(packet, 4, kPacketSize);
+    final payload =
+        _rxIsMuLaw ? MuLawCodec.decode(wirePayload) : wirePayload;
     _dsp.processBlock(
       rawBlock: payload,
       rssiDbm: _effectiveRssi,
@@ -952,6 +992,7 @@ class BluetoothManager {
       fecEnabled: signalSettings.fecEnabled,
       numChannels: _rxNumChannels,
       bitsPerSample: _rxBitsPerSample,
+      lostBlockSize: _rxBlockSizeDecoded,
     );
     if (_dsp.lastFecCorrectedBits > 0) {
       _algorithmLogController.add(
@@ -1038,8 +1079,11 @@ class BluetoothManager {
   }
 
   /// Bloques que debe acumular el Jitter Buffer antes de emitir un clip:
-  /// una ráfaga completa (2 s de voz ≈ 62 bloques de 1020 B).
-  static final int _minClipBlocks = kBurstPcmBytes ~/ kPayloadSize;
+  /// una ráfaga completa de audio DECODIFICADO. Con μ-law cada bloque de
+  /// 1020 B de aire se expande a 2040 B de PCM, así que 2 s de voz a 8 kHz
+  /// (32000 B) son ~15 bloques; en modo .wav (PCM lineal) el bloque queda
+  /// de 1020 B. Depende del códec anunciado, por eso no puede ser estático.
+  int get _minClipBlocks => kBurstPcmBytes ~/ _rxBlockSizeDecoded;
 
   /// Emite un clip solo cuando hay una ráfaga completa acumulada, O cuando
   /// el buffer dejó de crecer entre ticks (llegó el final de la transmisión
@@ -1152,6 +1196,7 @@ class BluetoothManager {
     _totalPacketsLost = 0;
     _totalPacketsRecovered = 0;
     _recentlyLostSeqs.clear();
+    _rxIsMuLaw = false;
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
     _rxBurstBytesRemaining = 0;

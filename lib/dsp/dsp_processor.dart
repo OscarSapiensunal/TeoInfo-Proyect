@@ -188,6 +188,7 @@ class DspProcessor {
     required bool fecEnabled,
     int numChannels = 1,
     int bitsPerSample = 16,
+    int lostBlockSize = kPayloadSize,
   }) {
     Uint8List workBlock;
     lastFecCorrectedBits = 0;
@@ -198,6 +199,7 @@ class DspProcessor {
         enabled: plcEnabled,
         numChannels: numChannels,
         bitsPerSample: bitsPerSample,
+        blockSize: lostBlockSize,
       );
     } else {
       workBlock = Uint8List.fromList(rawBlock); // copia defensiva
@@ -285,8 +287,8 @@ class DspProcessor {
     required bool enabled,
     required int numChannels,
     required int bitsPerSample,
+    int blockSize = kPayloadSize,
   }) {
-    final int blockSize = kPayloadSize; // bytes
     if (!enabled) {
       return Uint8List(blockSize);
     }

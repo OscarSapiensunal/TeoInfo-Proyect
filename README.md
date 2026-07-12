@@ -41,7 +41,7 @@ canal (RSSI, pérdida de paquetes, latencia) y aplicando técnicas de DSP en
 recepción para mitigar la degradación.
 
 **Objetivos específicos:**
-1. Digitalizar voz en PCM lineal (16 kHz, 16 bits, mono — cumpliendo el
+1. Digitalizar voz en PCM (8 kHz, mono, companding μ-law — cumpliendo el
    teorema de muestreo para voz) y transmitirla en ráfagas empaquetadas con
    números de secuencia sobre sockets RFCOMM.
 2. Detectar y cuantificar la pérdida de paquetes del canal real, y ocultarla
@@ -61,7 +61,8 @@ Conceptos del curso directamente aplicados:
 
 | Concepto (capítulo del curso) | Dónde aparece en el proyecto |
 |---|---|
-| **Teorema de muestreo** (Cap. III 3.1) | La voz se muestrea a 16 kHz: el ancho de banda útil de la voz (~300–3400 Hz, hasta ~7 kHz en banda ancha) queda por debajo de Nyquist (8 kHz). |
+| **Teorema de muestreo** (Cap. III 3.1) | La voz se muestrea a 8 kHz: el ancho de banda útil de la voz telefónica (~300–3400 Hz) queda por debajo de Nyquist (4 kHz) — la misma decisión de diseño de la telefonía clásica, tomada aquí para que la tasa de la fuente quepa en el throughput real del canal (ver dificultad 12). |
+| **PCM no uniforme — companding μ-law, G.711** (Cap. III 3.2) | Cada muestra se comprime de 16 a 8 bits con cuantización logarítmica implementada a mano (`companding.dart`): paso fino cerca de cero (donde vive la voz y el oído distingue) y grueso en amplitudes altas. Junto con los 8 kHz, reduce la fuente 4× (32→8 KB/s por dirección). |
 | **PCM — Modulación por codificación de pulsos** (Cap. III 3.2) | Cuantización uniforme a 16 bits por muestra, mono. El flujo se transmite sin compresión precisamente para analizar la señal "pura". |
 | **Transmisión digital de señales analógicas** (Cap. III) | Pipeline completo: micrófono (analógico) → ADC → empaquetado → canal → DAC → parlante. |
 | **Canal ruidoso** (Cap. IV 4.4) | El canal Bluetooth real presenta pérdida de paquetes y desvanecimiento con la distancia; la app lo cuantifica (loss %) en vez de simularlo. |
@@ -93,6 +94,7 @@ Conceptos del curso directamente aplicados:
 | Capacidad de Shannon + entropía de la fuente | **Propio** (`information_theory.dart`) |
 | Lectura de RSSI real vía GATT sobre BT Clásico (con *fallback* simulado si el teléfono no la soporta) | **Propio** (`MainActivity.kt` + `rssi_channel.dart`) |
 | FEC — Hamming (7,4), codificación/decodificación/corrección | **Propio** (`error_correction.dart`) |
+| Companding μ-law (G.711) — PCM logarítmico 16→8 bits | **Propio** (`companding.dart`) |
 | ARQ — protocolo NACK + caché de última ráfaga + reenvío | **Propio** (`app_models.dart` + `bluetooth_manager.dart`) |
 | Socket Bluetooth cliente | Librería `flutter_bluetooth_serial` |
 | Acceso a micrófono y parlante (drivers de audio) | Librería `flutter_sound` |
@@ -126,10 +128,10 @@ documenta ese proceso.
 ┌───────────────────┐                                      ┌────────────────────┐
 │ Micrófono         │                                      │ Parlante           │
 │   ↓ ADC           │      Bluetooth Clásico RFCOMM        │   ↑ DAC            │
-│ PCM 16kHz/16bit   │   (real: pérdidas, RSSI variable)    │ Clips de ~2 s      │
-│   ↓               │                                      │   ↑                │
+│ PCM 8kHz/16bit    │   (real: pérdidas, RSSI variable)    │ Clips de ~2 s      │
+│   ↓ μ-law (8bit)  │                                      │   ↑ μ-law → PCM    │
 │ Ráfagas de 2 s    │  ────────  paquetes 1024 B  ───────► │ Jitter buffer      │
-│ (64000 B c/u)     │                                      │   ↑                │
+│ (16000 B al aire) │                                      │   ↑                │
 │   ↓               │  ◄────────  ACK (20 B)  ───────────  │ DSP: PLC+AWGN+LP   │
 │ SEQ + timestamp   │                                      │   ↑                │
 └───────────────────┘                                      │ Detección pérdidas │
@@ -158,7 +160,8 @@ lib/
 │   ├── dsp_processor.dart             # Jitter Buffer, PLC, AWGN, filtros IIR+FIR (todo a mano)
 │   ├── echo_canceller.dart            # Cancelador de eco NLMS + semi-dúplex (todo a mano)
 │   ├── information_theory.dart        # Capacidad de Shannon + entropía de la fuente (todo a mano)
-│   └── error_correction.dart          # FEC Hamming (7,4): codifica/decodifica/corrige (todo a mano)
+│   ├── error_correction.dart          # FEC Hamming (7,4): codifica/decodifica/corrige (todo a mano)
+│   └── companding.dart                # μ-law G.711: PCM logarítmico 16→8 bits (todo a mano)
 ├── ui/
 │   └── ui_dashboard.dart              # Conectar (esperar/buscar), mic, métricas, gráfica
 └── utils/
@@ -290,8 +293,10 @@ ráfaga ya haya empezado.
 
 ### Ráfagas de voz y latencia
 
-- Captura PCM Int16 LE, **16 kHz mono** → ráfagas de **2 s = 64 000 bytes**
-  (63 paquetes de 1020 B, el último con relleno).
+- Captura PCM Int16 LE, **8 kHz mono** → ráfagas de **2 s = 32 000 bytes**
+  de PCM lineal → **16 000 bytes al aire tras companding μ-law** (16
+  paquetes de 1020 B, el último con relleno de silencio μ-law 0xFF — no
+  ceros binarios, que en μ-law decodifican a casi fondo de escala).
 - Cada ráfaga viaja precedida de su cabecera con `txEpochMs` del emisor.
 - **Latencia en el receptor:** `rxEpochMs − txEpochMs` al completar la ráfaga
   (estimación sujeta al desfase de reloj entre teléfonos).
@@ -476,10 +481,21 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    (±1 dB, clamped) para el modo simulado, más sondeo de RSSI real en AMBOS
    roles (host y cliente), con un indicador en la UI de cuál de los dos modos
    está activo en cada momento.
-
----
-
-## 10. Conclusiones (síntesis sugerida para el informe)
+11. **La latencia solo crecía hasta ahogar el enlace (~11 s y silencio).**
+   Dos causas encadenadas. (a) Sin control de saturación, la cadena de envío
+   encolaba TODAS las ráfagas: si el canal entrega menos de lo que el
+   micrófono produce, cada ráfaga sale más tarde que la anterior y el atraso
+   solo puede crecer — se añadió *backpressure* (máx. 2 ráfagas en vuelo,
+   descartar la nueva si hay saturación). (b) Pero el problema era
+   ESTRUCTURAL: PCM lineal 16 kHz/16 bit son 32 KB/s por dirección — con
+   ambos teléfonos hablando (full-dúplex), más de lo que RFCOMM da en la
+   práctica. La solución de fondo fue **adaptar la tasa de la fuente a la
+   capacidad del canal**: muestrear a 8 kHz (Nyquist para voz telefónica de
+   300–3400 Hz) y comprimir 16→8 bits con companding μ-law (G.711) — 4×
+   menos datos (8 KB/s por dirección), el enlace queda holgado y la
+   latencia se estabiliza en vez de crecer. Es el ciclo completo de
+   ingeniería del curso: medir el canal → detectar que la fuente lo excede
+   → recodificar la fuente (Cap. III) para que quepa (Cap. IV).
 
 1. Se implementó un sistema de comunicación digital de voz funcional de
    extremo a extremo sobre un canal inalámbrico real, cumpliendo el objetivo

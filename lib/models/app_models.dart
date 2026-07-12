@@ -56,14 +56,30 @@ int parseSequenceNumber(Uint8List packet) {
 /// Duración de cada ráfaga de audio capturada del micrófono (ms).
 const int kBurstDurationMs = 2000;
 
-/// Formato de captura del micrófono: PCM lineal Int16 LE mono a 16 kHz.
-const int kMicSampleRate = 16000;
+/// Formato de captura del micrófono: PCM lineal Int16 LE mono a 8 kHz.
+///
+/// 8 kHz (no 16): la voz telefónica ocupa 300-3400 Hz, así que por el
+/// teorema de muestreo 8 kHz bastan para reconstruirla — y a la vez reduce
+/// a la MITAD la carga sobre el canal RFCOMM, cuyo throughput real no
+/// soportaba PCM de 16 kHz en ambas direcciones a la vez (la fuente
+/// producía más de lo que el canal entregaba → latencia siempre creciente
+/// hasta ahogar el enlace, confirmado en campo). Antes de salir al aire,
+/// además, cada muestra se comprime de 16 a 8 bits con μ-law (ver
+/// companding.dart) — reducción total de la fuente: 4×.
+const int kMicSampleRate = 8000;
 const int kMicNumChannels = 1;
 const int kMicBitsPerSample = 16;
 
-/// Bytes de PCM por ráfaga: 16000 Hz × 1 ch × 2 B × 2 s = 64000 bytes.
+/// Bytes de PCM (lineal, ANTES del companding) por ráfaga:
+/// 8000 Hz × 1 ch × 2 B × 2 s = 32000 bytes → 16000 bytes μ-law al aire.
 const int kBurstPcmBytes =
     kMicSampleRate * kMicNumChannels * (kMicBitsPerSample ~/ 8) * kBurstDurationMs ~/ 1000;
+
+/// Identificadores de códec para el meta-paquete (byte 8):
+/// el modo laboratorio (.wav) transmite PCM lineal tal cual; el modo voz
+/// transmite μ-law para caber en el canal.
+const int kCodecPcm16 = 0;
+const int kCodecMuLaw = 1;
 
 /// Magic bytes de la cabecera de ráfaga (emisor → receptor).
 const int kBurstMagic0 = 0xCC;

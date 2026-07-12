@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dsp_bt_analyzer/models/app_models.dart';
+import 'package:dsp_bt_analyzer/dsp/companding.dart';
 import 'package:dsp_bt_analyzer/dsp/dsp_processor.dart';
 import 'package:dsp_bt_analyzer/dsp/error_correction.dart';
 
@@ -54,8 +55,8 @@ void main() {
     expect(parsed.rxEpochMs, rx);
   });
 
-  test('Tamaño de ráfaga: 2 s de PCM 16 kHz mono Int16 = 64000 bytes', () {
-    expect(kBurstPcmBytes, 64000);
+  test('Tamaño de ráfaga: 2 s de PCM 8 kHz mono Int16 = 32000 bytes', () {
+    expect(kBurstPcmBytes, 32000);
   });
 
   test('Jitter Buffer: processBlock encola sin auto-extraer (fillRatio real)', () {
@@ -130,5 +131,35 @@ void main() {
     final decoded = HammingCodec.decode(corrupted);
     expect(decoded.data, equals(data));
     expect(decoded.correctedBits, 2);
+  });
+
+  test('μ-law: silencio digital codifica a 0xFF y decodifica a 0', () {
+    expect(MuLawCodec.encodeSample(0), MuLawCodec.kSilenceByte);
+    expect(MuLawCodec.decodeSample(MuLawCodec.kSilenceByte), 0);
+  });
+
+  test('μ-law: error de cuantización acotado y signo preservado', () {
+    // La cuantización μ-law es logarítmica: el paso crece con la amplitud
+    // (fino cerca de 0, grueso en fondo de escala) pero el error relativo
+    // se mantiene acotado. Verificamos sobre una rampa de amplitudes que
+    // el round-trip conserva el signo y el error no supera el paso del
+    // segmento correspondiente (~ amplitud/16 + sesgo).
+    for (int s = -30000; s <= 30000; s += 977) {
+      final decoded = MuLawCodec.decodeSample(MuLawCodec.encodeSample(s));
+      if (s != 0) {
+        expect(decoded.sign, s.sign, reason: 'signo en s=$s');
+      }
+      final tolerance = (s.abs() / 16) + 132;
+      expect((decoded - s).abs() <= tolerance, isTrue,
+          reason: 'error de cuantización excesivo en s=$s → $decoded');
+    }
+  });
+
+  test('μ-law: encode reduce a la mitad y decode restaura el tamaño', () {
+    final pcm = Uint8List.fromList(List.generate(64, (i) => i * 3));
+    final encoded = MuLawCodec.encode(pcm);
+    expect(encoded.length, pcm.length ~/ 2);
+    final decoded = MuLawCodec.decode(encoded);
+    expect(decoded.length, pcm.length);
   });
 }
