@@ -27,6 +27,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../bluetooth/bluetooth_manager.dart';
 import '../bluetooth/audio_player_service.dart';
+import '../bluetooth/system_channel.dart';
 import '../models/app_models.dart';
 
 class AppState extends ChangeNotifier {
@@ -398,6 +399,9 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     _listenToStreams();
     btManager.isSpeakerActive = () => audioPlayer.isPlaying;
+    // La pantalla no debe apagarse durante la sesión: al bloquearse, Android
+    // estrangula la app (Doze) y la reproducción acumula segundos de atraso.
+    await SystemChannel.keepScreenOn(true);
     await audioPlayer.init();
   }
 
@@ -493,6 +497,7 @@ class AppState extends ChangeNotifier {
     _infoTheorySub = null; _algorithmLogSub = null;
     await btManager.disconnect();
     await audioPlayer.stopStreaming();
+    await SystemChannel.keepScreenOn(false);
     _statusMessage = 'Sesión finalizada';
     notifyListeners();
   }

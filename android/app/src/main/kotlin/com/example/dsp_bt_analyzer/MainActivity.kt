@@ -29,6 +29,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -44,6 +45,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "DspBtAnalyzer"
         private const val RSSI_CHANNEL = "com.dsp_bt_analyzer/rssi"
+        private const val SYSTEM_CHANNEL = "com.dsp_bt_analyzer/system"
         private const val SERVER_CHANNEL = "com.dsp_bt_analyzer/spp_server"
         private const val SERVER_EVENTS_CHANNEL = "com.dsp_bt_analyzer/spp_server_events"
         private const val SPP_SERVICE_NAME = "DSP_BT_ANALYZER"
@@ -135,6 +137,31 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
                 "isConnected" -> result.success(clientSocket?.isConnected == true)
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            SYSTEM_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                // Mantiene la pantalla encendida mientras hay sesión activa.
+                // Si Android apaga/bloquea la pantalla, la app pasa a segundo
+                // plano y el sistema estrangula sus timers y su CPU (Doze):
+                // el audio y los paquetes BT siguen llegando pero se procesan
+                // a trompicones y la reproducción acumula segundos de atraso.
+                "keepScreenOn" -> {
+                    val on = call.argument<Boolean>("on") ?: false
+                    postSafely {
+                        if (on) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
+                    }
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
