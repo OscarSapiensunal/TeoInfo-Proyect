@@ -40,11 +40,25 @@ import 'rssi_channel.dart';
 /// Intervalo entre paquetes en modo archivo WAV (ms).
 const int kPacketIntervalMs = 11;
 
-/// Período de consulta de RSSI (ms).
-const int kRssiPollIntervalMs = 1000;
+/// Período de consulta de RSSI (ms). Cada lectura real implica una conexión
+/// GATT completa (conectar → leer → cerrar, ~0.5-1.5 s), así que sondear
+/// más rápido solo apila conexiones sin ganar resolución útil.
+const int kRssiPollIntervalMs = 2000;
 
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo.
-const int kMaxConsecutiveLostPackets = 50;
+/// DEBE cubrir al menos 2 ráfagas completas (63 paquetes c/u): una ráfaga
+/// entera puede perderse de golpe, y con un tope menor que eso el conteo
+/// además rompe la ventana del ARQ (ver kArqRecoveryWindowPackets).
+const int kMaxConsecutiveLostPackets = 126;
+
+/// Ventana hacia atrás (en números de secuencia) dentro de la cual un
+/// paquete "atrasado" se interpreta como retransmisión ARQ y no como un
+/// salto gigante hacia adelante. Debe ser MAYOR que el máximo de pérdidas
+/// contabilizables de una vez: si fuera menor (bug original: 50 < 63
+/// paquetes por ráfaga), la retransmisión de una ráfaga completa caería al
+/// detector de pérdidas y se contaría como un falso salto adelante de
+/// decenas de miles de paquetes.
+const int kArqRecoveryWindowPackets = 128;
 
 /// UUID del perfil SPP (Serial Port Profile) — estándar Bluetooth Classic.
 const String kSppUuid = '00001101-0000-1000-8000-00805F9B34FB';
@@ -95,7 +109,16 @@ class BluetoothManager {
   Uint8List? _lastSentBurstPcm;
   int? _lastSentBurstId;
   int? _lastSentBurstStartSeq;
-  final Set<int> _lostSeqsInCurrentBurst = {};
+
+  /// SEQs marcados como perdidos recientemente, a la espera de una posible
+  /// retransmisión. NO se limpia al llegar la siguiente cabecera de ráfaga:
+  /// el reenvío viaja encolado detrás de la ráfaga en curso del emisor y es
+  /// normal que llegue DESPUÉS de que la siguiente ráfaga ya empezó — solo
+  /// la ventana de secuencia ([kArqRecoveryWindowPackets]) decide si un SEQ
+  /// atrasado sigue siendo recuperable. Con tope para no crecer sin límite
+  /// en sesiones largas con muchas pérdidas nunca recuperadas.
+  final Set<int> _recentlyLostSeqs = {};
+  static const int _kMaxTrackedLostSeqs = 256;
   int _totalPacketsRecovered = 0;
 
   // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
@@ -132,6 +155,7 @@ class BluetoothManager {
   double _currentRssi = -60.0;
   bool _rssiIsReal = false;
   Timer? _rssiTimer;
+  bool _rssiPollBusy = false;
   final math.Random _rssiRng = math.Random();
 
   // ── Buffer de reensamblado de paquetes (el socket BT puede fragmentar) ─────
@@ -411,6 +435,10 @@ class BluetoothManager {
     } else {
       await _pcmSub?.cancel();
       _pcmSub = null;
+      // Descartar el residuo parcial acumulado: si quedara, al reactivar el
+      // micrófono la primera ráfaga arrancaría con audio viejo de antes del
+      // silencio (confuso para quien escucha).
+      _burstBuilder.clear();
       try {
         await _capture.stopCapture();
       } catch (e) {
@@ -739,10 +767,6 @@ class BluetoothManager {
       _rxBurstId = header.burstId;
       _rxBurstTxEpochMs = header.txEpochMs;
       _rxBurstBytesRemaining = header.pcmByteLength;
-      // Ventana de gracia para retransmisiones ARQ de la ráfaga ANTERIOR:
-      // se limpia recién cuando empieza la siguiente, no al completar ésta,
-      // para darle al NACK+reenvío tiempo de llegar aunque sea tarde.
-      _lostSeqsInCurrentBurst.clear();
       _log.i('RX cabecera ráfaga #${header.burstId}: '
           '${header.pcmByteLength} B esperados');
       return;
@@ -788,20 +812,32 @@ class BluetoothManager {
 
     // ── ARQ: ¿es la retransmisión tardía de un paquete ya marcado perdido? ──
     // Un SEQ "atrasado" respecto al último aceptado, dentro de la ventana de
-    // pérdidas recientes, no es un paquete nuevo — es la respuesta a un NACK.
-    // Se recupera SIN tocar el Jitter Buffer/PLC (ya jugaron su parte para
-    // ese hueco): se manda directo a reproducción como un clip corto extra.
+    // recuperación, no es un paquete nuevo — es la respuesta a un NACK. El
+    // payload recuperado se encola al final del Jitter Buffer (sale con el
+    // siguiente clip, junto al resto del audio): reproducirlo como clip
+    // aparte producía un "clic" de 32 ms con ~200 ms de arranque, y además
+    // competía por los 4 cupos de la cola de reproducción con los clips
+    // reales. RFCOMM es un transporte ordenado, así que el ÚNICO origen
+    // posible de un SEQ atrasado son nuestras propias retransmisiones.
     if (_lastSequenceNumber != -1) {
       final int backDistance = (_lastSequenceNumber - seqNum) & 0xFFFF;
-      if (backDistance > 0 && backDistance <= kMaxConsecutiveLostPackets) {
-        if (_lostSeqsInCurrentBurst.remove(seqNum)) {
+      if (backDistance > 0 && backDistance <= kArqRecoveryWindowPackets) {
+        if (_recentlyLostSeqs.remove(seqNum)) {
           _totalPacketsRecovered++;
           _totalPacketsLost = (_totalPacketsLost - 1).clamp(0, 1 << 30);
-          final recovered = Uint8List.fromList(
-              Uint8List.sublistView(packet, 4, kPacketSize));
-          _audioChunkController.add(recovered);
-          _algorithmLogController
-              .add('ARQ: paquete SEQ=$seqNum recuperado por retransmisión');
+          _dsp.processBlock(
+            rawBlock: Uint8List.sublistView(packet, 4, kPacketSize),
+            rssiDbm: _currentRssi,
+            isLost: false,
+            plcEnabled: signalSettings.plcEnabled,
+            filterEnabled: signalSettings.filterEnabled,
+            fecEnabled: signalSettings.fecEnabled,
+            numChannels: _rxNumChannels,
+            bitsPerSample: _rxBitsPerSample,
+          );
+          _algorithmLogController.add(
+              'ARQ: paquete SEQ=$seqNum recuperado por retransmisión '
+              '(añadido al final del buffer)');
           _metricsController.add(currentMetrics);
         } else {
           _log.d('Paquete SEQ=$seqNum ignorado (duplicado o fuera de '
@@ -823,13 +859,18 @@ class BluetoothManager {
         _totalPacketsLost += lostInGap;
         _log.w('Pérdida detectada: seq esperada=$expected recibida=$seqNum '
             'perdidos=$lostInGap');
-        _algorithmLogController.add(
-            'PLC: $lostInGap paquete(s) perdido(s) → repetición atenuada '
-            '(-3 dB por repetición)');
+        _algorithmLogController.add(signalSettings.plcEnabled
+            ? 'PLC: $lostInGap paquete(s) perdido(s) → repetición atenuada '
+                '(-3 dB por repetición)'
+            : 'Pérdida: $lostInGap paquete(s) — PLC apagado, queda un hueco '
+                'de silencio');
 
         if (signalSettings.arqEnabled && _rxBurstId != null) {
           for (int i = 0; i < lostInGap; i++) {
-            _lostSeqsInCurrentBurst.add((expected + i) & 0xFFFF);
+            _recentlyLostSeqs.add((expected + i) & 0xFFFF);
+          }
+          while (_recentlyLostSeqs.length > _kMaxTrackedLostSeqs) {
+            _recentlyLostSeqs.remove(_recentlyLostSeqs.first);
           }
           _algorithmLogController
               .add('ARQ: solicitando reenvío de la ráfaga #$_rxBurstId');
@@ -1002,11 +1043,17 @@ class BluetoothManager {
     ));
 
     final bool degraded = _currentRssi < kRssiWeakThreshold;
+    final String degradedNote = !degraded
+        ? ''
+        : signalSettings.filterEnabled
+            ? ' · canal degradado: AWGN inyectado + filtro IIR/FIR limpiando '
+                '(RSSI ${_currentRssi.toStringAsFixed(0)} dBm)'
+            : ' · canal degradado: AWGN inyectado SIN filtrar — filtro apagado '
+                '(RSSI ${_currentRssi.toStringAsFixed(0)} dBm)';
     _algorithmLogController.add(
       'Clip reproducido (${(clip.length / 1024).toStringAsFixed(1)} KB): '
       'H(X)=${entropy.toStringAsFixed(2)}/${maxEntropy.toStringAsFixed(0)} bits/muestra, '
-      'C≈${(capacityBps / 1000).toStringAsFixed(1)} kbps'
-      '${degraded ? ' · AWGN+filtro IIR/FIR activos (RSSI ${_currentRssi.toStringAsFixed(0)} < -75 dBm)' : ''}',
+      'C≈${(capacityBps / 1000).toStringAsFixed(1)} kbps$degradedNote',
     );
   }
 
@@ -1025,6 +1072,12 @@ class BluetoothManager {
     _rssiTimer = Timer.periodic(
       const Duration(milliseconds: kRssiPollIntervalMs),
       (_) async {
+        // Timer.periodic NO espera al cuerpo async: sin este guard, una
+        // lectura GATT lenta (hasta 3 s de timeout) se solaparía con los
+        // ticks siguientes, apilando conexiones GATT concurrentes al mismo
+        // dispositivo — cada una consume un handle del sistema.
+        if (_rssiPollBusy) return;
+        _rssiPollBusy = true;
         try {
           _currentRssi = await RssiChannel.getRssi(address);
           _rssiIsReal = true;
@@ -1037,6 +1090,8 @@ class BluetoothManager {
           // monótona hacia el piso.
           final double step = (_rssiRng.nextDouble() * 2.0) - 1.0;
           _currentRssi = (_currentRssi + step).clamp(-95.0, -40.0);
+        } finally {
+          _rssiPollBusy = false;
         }
       },
     );
@@ -1052,7 +1107,7 @@ class BluetoothManager {
     _totalPacketsReceived = 0;
     _totalPacketsLost = 0;
     _totalPacketsRecovered = 0;
-    _lostSeqsInCurrentBurst.clear();
+    _recentlyLostSeqs.clear();
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
     _rxBurstBytesRemaining = 0;

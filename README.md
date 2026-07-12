@@ -277,12 +277,16 @@ simuladas.
 **Cómo funciona el ARQ sin arriesgar el Jitter Buffer ya probado:** en vez de
 reinsertar el paquete recuperado en su posición exacta dentro del buffer
 circular (que ya jugó su parte con PLC para ese hueco), el paquete
-retransmitido se reproduce como un clip corto adicional, apenas llega —
-simple y no toca la lógica de temporización del Jitter Buffer que costó
-varias iteraciones dejar estable (ver Dificultades §4-5). El costo real: el
-audio recuperado puede sonar un poco fuera de orden/con retraso — un
-trade-off genuino de ARQ sobre un canal con latencia, no una simplificación
-que se esconda.
+retransmitido se añade al FINAL del Jitter Buffer y sale con el siguiente
+clip, junto al resto del audio — simple y sin tocar la lógica de
+temporización que costó varias iteraciones dejar estable (ver Dificultades
+§4-5). El costo real: el audio recuperado suena fuera de orden (llega
+tarde) — un trade-off genuino de ARQ sobre un canal con latencia, no una
+simplificación que se esconda. Como RFCOMM es un transporte ordenado, un
+número de secuencia "atrasado" solo puede ser una retransmisión nuestra —
+la ventana de reconocimiento cubre 2 ráfagas completas (128 paquetes) para
+que el reenvío se reconozca aunque llegue después de que la siguiente
+ráfaga ya haya empezado.
 
 ### Ráfagas de voz y latencia
 

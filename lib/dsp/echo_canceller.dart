@@ -90,11 +90,21 @@ class EchoCanceller {
     for (int i = 0; i < n; i++) {
       final double d = view.getInt16(i * 2, Endian.little) / 32768.0;
 
+      // La ventana de referencia DEBE deslizarse muestra a muestra junto con
+      // la señal del micrófono (x[n-k] en la ecuación NLMS): se alinea la
+      // última muestra del bloque del mic con la última referencia escrita y
+      // cada muestra anterior mira una posición más atrás. (Bug original:
+      // todas las muestras del bloque usaban la MISMA ventana fija — sin
+      // deslizamiento no hay correlación temporal que estimar y el filtro
+      // degeneraba en un passthrough.)
+      final int refNewest = _refWriteIndex - 1 - (n - 1 - i);
+
       double y = 0.0;
       double energy = 1e-6; // evita división por cero al normalizar
       for (int k = 0; k < filterLength; k++) {
-        final int refIdx = (_refWriteIndex - 1 - k) % _refCapacity;
-        final double x = _referenceRing[refIdx < 0 ? refIdx + _refCapacity : refIdx];
+        int refIdx = (refNewest - k) % _refCapacity;
+        if (refIdx < 0) refIdx += _refCapacity;
+        final double x = _referenceRing[refIdx];
         y += _weights[k] * x;
         energy += x * x;
       }
@@ -102,9 +112,9 @@ class EchoCanceller {
       final double e = d - y;
       final double muOverEnergy = stepSize * e / energy;
       for (int k = 0; k < filterLength; k++) {
-        final int refIdx = (_refWriteIndex - 1 - k) % _refCapacity;
-        final double x = _referenceRing[refIdx < 0 ? refIdx + _refCapacity : refIdx];
-        _weights[k] += muOverEnergy * x;
+        int refIdx = (refNewest - k) % _refCapacity;
+        if (refIdx < 0) refIdx += _refCapacity;
+        _weights[k] += muOverEnergy * _referenceRing[refIdx];
       }
 
       final int outSample = (e * 32768.0).round().clamp(-32768, 32767);

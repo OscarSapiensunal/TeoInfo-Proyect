@@ -203,7 +203,11 @@ class AppState extends ChangeNotifier {
     try {
       final file = File(path);
       final raf  = await file.open();
-      final headerBytes = Uint8List(512);
+      // 64 KB y no 512 B: el chunk "data" no siempre está al principio —
+      // WAVs exportados por editores/grabadoras suelen traer chunks LIST/
+      // INFO/bext de metadatos de varios KB antes, y el parser necesita
+      // alcanzar el inicio de "data" para validar el archivo.
+      final headerBytes = Uint8List(64 * 1024);
       await raf.readInto(headerBytes);
       await raf.close();
       final header = WavHeader.parse(headerBytes);

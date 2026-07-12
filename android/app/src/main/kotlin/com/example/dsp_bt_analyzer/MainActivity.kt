@@ -62,6 +62,13 @@ class MainActivity : FlutterActivity() {
     private var clientOut: OutputStream? = null
     private var serverEventSink: EventChannel.EventSink? = null
     @Volatile private var serverRunning = false
+
+    /// Generación del servidor: si el usuario reinicia la escucha (doble tap
+    /// en "Esperar conexión", nueva sesión), el hilo del servidor VIEJO — que
+    /// muere con una excepción al cerrársele el socket — no debe emitir su
+    /// error/desconexión a la sesión NUEVA. Cada hilo captura su generación
+    /// y solo emite si sigue siendo la vigente.
+    @Volatile private var serverGeneration = 0
     private val writeExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -175,6 +182,7 @@ class MainActivity : FlutterActivity() {
     private fun startSppServer() {
         stopSppServer()
         serverRunning = true
+        val generation = ++serverGeneration
 
         Thread {
             try {
@@ -218,9 +226,11 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 }
-                emitServerEvent(mapOf("event" to "disconnected"))
+                if (generation == serverGeneration) {
+                    emitServerEvent(mapOf("event" to "disconnected"))
+                }
             } catch (e: Exception) {
-                if (serverRunning) {
+                if (serverRunning && generation == serverGeneration) {
                     Log.w(TAG, "Error en servidor SPP: ${e.message}")
                     emitServerEvent(
                         mapOf("event" to "error", "message" to (e.message ?: "desconocido"))
@@ -258,28 +268,63 @@ class MainActivity : FlutterActivity() {
             return
         }
 
+        // FUGA CORREGIDA: cada llamada crea una conexión GATT nueva; si esa
+        // conexión nunca llegaba a STATE_CONNECTED (peer BT Clásico sin GATT,
+        // frecuente), NADIE llamaba a gatt.close() — un handle GATT filtrado
+        // por cada sondeo. Android limita ~32 clientes GATT por proceso: en
+        // medio minuto de sondeos fallidos se agotaban y toda lectura real
+        // posterior quedaba imposible para el resto de la sesión. Ahora un
+        // watchdog cierra el GATT y responde error si no hay respuesta a
+        // tiempo, y `answered` garantiza una única respuesta al canal.
+        val answered = java.util.concurrent.atomic.AtomicBoolean(false)
+        val gattHolder = arrayOfNulls<BluetoothGatt>(1)
+
+        fun finish(reply: () -> Unit) {
+            if (answered.compareAndSet(false, true)) {
+                postSafely(reply)
+                try { gattHolder[0]?.disconnect() } catch (_: Exception) {}
+                try { gattHolder[0]?.close() } catch (_: Exception) {}
+            }
+        }
+
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     gatt.readRemoteRssi()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    gatt.close()
+                    finish {
+                        result.error(
+                            "GATT_DISCONNECTED",
+                            "GATT desconectado antes de leer RSSI",
+                            null
+                        )
+                    }
                 }
             }
 
             override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
-                latestRssi.set(rssi)
-                postSafely { result.success(rssi.toDouble()) }
-                gatt.disconnect()
-                gatt.close()
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    latestRssi.set(rssi)
+                    finish { result.success(rssi.toDouble()) }
+                } else {
+                    finish {
+                        result.error("RSSI_READ_FAILED", "status=$status", null)
+                    }
+                }
             }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        gattHolder[0] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(this, false, callback, BluetoothDevice.TRANSPORT_BREDR)
         } else {
             device.connectGatt(this, false, callback)
         }
+
+        mainHandler.postDelayed({
+            finish {
+                result.error("RSSI_TIMEOUT", "Sin respuesta GATT en 2.5 s", null)
+            }
+        }, 2500L)
     }
 
     // ── Polling periódico de RSSI (reutiliza gatt) ───────────────────────

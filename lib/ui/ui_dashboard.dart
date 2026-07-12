@@ -18,6 +18,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../dsp/dsp_processor.dart' show kRssiWeakThreshold;
 import '../models/app_models.dart';
 import '../utils/app_state.dart';
 
@@ -75,6 +76,8 @@ class UiDashboard extends StatelessWidget {
               SizedBox(height: 12),
               _AlgorithmLogCard(),
               SizedBox(height: 16),
+              _SessionStatusBadge(),
+              SizedBox(height: 8),
               _StopSessionButton(),
               SizedBox(height: 24),
             ],
@@ -550,6 +553,18 @@ class _SignalOptimizationCard extends StatelessWidget {
             Text(
               'ARQ recuperó ${state.metrics.packetsRecovered} paquete(s) por retransmisión',
               style: const TextStyle(color: _C.accentGreen, fontSize: 11),
+            ),
+          ],
+          // Sin degradación no hay nada que corregir: avisar para que el
+          // switch no parezca "muerto" cuando el canal simplemente está sano.
+          if (state.metrics.rssiDbm >= kRssiWeakThreshold) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Señal fuerte ahora mismo (${state.metrics.rssiDbm.toStringAsFixed(0)} dBm): '
+              'el canal casi no se degrada, así que varias mejoras no tienen '
+              'nada que corregir. Aleja los teléfonos o pon obstáculos para '
+              'sentir la diferencia.',
+              style: const TextStyle(color: _C.accentAmber, fontSize: 10),
             ),
           ],
           const SizedBox(height: 4),
@@ -1213,6 +1228,24 @@ class _RealtimeChartCard extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESTADO DE LA SESIÓN ACTIVA — sin esto, los mensajes de estado (errores de
+// micrófono, desconexiones, progreso de transmisión) eran invisibles durante
+// la sesión: el único _StatusBadge vivía dentro de la card "Conectar", que
+// se oculta por completo una vez conectado.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SessionStatusBadge extends StatelessWidget {
+  const _SessionStatusBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.isActive) return const SizedBox.shrink();
+    return _StatusBadge(message: state.statusMessage);
   }
 }
 
