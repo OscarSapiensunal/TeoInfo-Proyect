@@ -41,12 +41,13 @@ class AudioPlayerService {
   final Queue<Uint8List> _queue = Queue<Uint8List>();
 
   /// Tope de la cola de clips pendientes. Cada startPlayer() añade una
-  /// pequeña pausa entre clips, así que la reproducción es ligeramente más
-  /// lenta que la llegada de audio — sin tope, la cola crecería sin límite
-  /// en sesiones largas (memoria) y la voz quedaría cada vez más retrasada.
-  /// Con drop-oldest, en el peor caso se pierde el clip más viejo y la
-  /// conversación se mantiene cerca del presente.
-  static const int kMaxQueuedClips = 4;
+  /// pequeña pausa entre clips (~0.2 s), así que reproducir 2 s de audio
+  /// tarda ~2.2 s: la reproducción es estructuralmente más lenta que la
+  /// llegada y sin tope la cola crece sin límite (latencia siempre en
+  /// aumento). Con drop-oldest y tope 2, la latencia embalsada queda
+  /// acotada a ~2 clips (~5 s peor caso): se prefiere perder el fragmento
+  /// más viejo a que toda la conversación quede en diferido.
+  static const int kMaxQueuedClips = 2;
 
   // ─────────────────────────────────────────────────────────────────────────
   // INICIALIZACIÓN

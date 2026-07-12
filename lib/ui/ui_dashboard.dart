@@ -557,17 +557,36 @@ class _SignalOptimizationCard extends StatelessWidget {
           ],
           // Sin degradación no hay nada que corregir: avisar para que el
           // switch no parezca "muerto" cuando el canal simplemente está sano.
-          if (state.metrics.rssiDbm >= kRssiWeakThreshold) ...[
+          if (!state.forceDegradedChannel &&
+              state.metrics.rssiDbm >= kRssiWeakThreshold) ...[
             const SizedBox(height: 4),
             Text(
               'Señal fuerte ahora mismo (${state.metrics.rssiDbm.toStringAsFixed(0)} dBm): '
               'el canal casi no se degrada, así que varias mejoras no tienen '
-              'nada que corregir. Aleja los teléfonos o pon obstáculos para '
-              'sentir la diferencia.',
+              'nada que corregir. Aleja los teléfonos, pon obstáculos, o usa '
+              '"Simular canal degradado" para sentir la diferencia ya.',
               style: const TextStyle(color: _C.accentAmber, fontSize: 10),
             ),
           ],
           const SizedBox(height: 4),
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Simular canal degradado (demo): mete ruido y errores de '
+                  'bit como si la señal estuviera muy débil, aunque los '
+                  'teléfonos estén juntos — así Filtro y FEC actúan de '
+                  'inmediato.',
+                  style: TextStyle(color: _C.textMuted, fontSize: 10),
+                ),
+              ),
+              Switch(
+                value: state.forceDegradedChannel,
+                activeThumbColor: _C.accentAmber,
+                onChanged: state.setForceDegradedChannel,
+              ),
+            ],
+          ),
           Theme(
             data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
             child: ExpansionTile(

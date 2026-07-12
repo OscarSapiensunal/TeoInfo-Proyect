@@ -105,6 +105,19 @@ class BluetoothManager {
   /// (todo apagado) para poder escuchar primero la señal cruda.
   SignalOptimizationSettings signalSettings = SignalOptimizationSettings.raw;
 
+  /// Demo de canal degradado: fuerza el pipeline DSP a comportarse como si
+  /// el RSSI estuviera en -85 dBm (AWGN + bit-errores simulados activos)
+  /// aunque los teléfonos estén juntos con señal excelente. Sin esto, en
+  /// una demo a corta distancia el canal real es tan bueno que los toggles
+  /// de Filtro/FEC no tienen nada que corregir y "no se sienten". Solo
+  /// afecta la degradación SIMULADA — las métricas (RSSI mostrado, pérdida
+  /// real) siguen reportando la verdad del canal físico.
+  bool forceDegradedChannel = false;
+
+  /// RSSI efectivo que ve el pipeline DSP (no el que reportan las métricas).
+  double get _effectiveRssi =>
+      forceDegradedChannel ? math.min(_currentRssi, -85.0) : _currentRssi;
+
   // ── Estado de ARQ (retransmisión de ráfagas a pedido) ─────────────────────
   Uint8List? _lastSentBurstPcm;
   int? _lastSentBurstId;
@@ -490,6 +503,22 @@ class BluetoothManager {
   }
 
   /// Extrae y envía cada ráfaga completa acumulada en [_burstBuilder].
+  ///
+  /// BACKPRESSURE (control de saturación): el micrófono produce a ritmo
+  /// fijo (1 ráfaga cada 2 s), pero el canal RFCOMM entrega a un ritmo que
+  /// depende del entorno — y con AMBOS teléfonos transmitiendo a la vez
+  /// (full-dúplex, modo sin optimizar) la demanda combinada puede superar lo
+  /// que el enlace físico realmente da. Sin este límite, la cadena de envío
+  /// acumulaba ráfagas sin tope: cada una salía más tarde que la anterior,
+  /// la latencia SOLO podía crecer, y al final el enlace se ahogaba hasta el
+  /// silencio total (confirmado en campo). Con el límite, si ya hay 2
+  /// ráfagas esperando turno la nueva se DESCARTA: se pierde ese fragmento
+  /// de voz (2 s), pero la conversación se mantiene cerca del presente —
+  /// en tiempo real, fresco-e-incompleto vale más que completo-y-atrasado.
+  static const int _kMaxBurstsInFlight = 2;
+  int _burstsInFlight = 0;
+  int _txBurstsDropped = 0;
+
   void _flushReadyBursts() {
     while (_burstBuilder.length >= kBurstPcmBytes) {
       final all = _burstBuilder.takeBytes();
@@ -498,12 +527,25 @@ class BluetoothManager {
         _burstBuilder.add(Uint8List.sublistView(all, kBurstPcmBytes));
       }
 
+      if (_burstsInFlight >= _kMaxBurstsInFlight) {
+        _txBurstsDropped++;
+        _log.w('TX saturado: ráfaga descartada '
+            '($_txBurstsDropped descartadas en total)');
+        _algorithmLogController.add(
+            'Backpressure: canal saturado → ráfaga de voz descartada en el '
+            'emisor (no se acumula atraso)');
+        continue;
+      }
+
       final id = _txBurstId;
       _txBurstId = (_txBurstId + 1) & 0xFFFF;
+      _burstsInFlight++;
       _sendChain = _sendChain
           .then((_) => _sendBurst(id, burst))
           .catchError((Object e) {
         _log.w('Error enviando ráfaga #$id: $e');
+      }).whenComplete(() {
+        if (_burstsInFlight > 0) _burstsInFlight--;
       });
     }
   }
@@ -827,7 +869,7 @@ class BluetoothManager {
           _totalPacketsLost = (_totalPacketsLost - 1).clamp(0, 1 << 30);
           _dsp.processBlock(
             rawBlock: Uint8List.sublistView(packet, 4, kPacketSize),
-            rssiDbm: _currentRssi,
+            rssiDbm: _effectiveRssi,
             isLost: false,
             plcEnabled: signalSettings.plcEnabled,
             filterEnabled: signalSettings.filterEnabled,
@@ -883,7 +925,7 @@ class BluetoothManager {
         for (int i = 0; i < lostInGap; i++) {
           _dsp.processBlock(
             rawBlock: null,
-            rssiDbm: _currentRssi,
+            rssiDbm: _effectiveRssi,
             isLost: true,
             plcEnabled: signalSettings.plcEnabled,
             filterEnabled: signalSettings.filterEnabled,
@@ -903,7 +945,7 @@ class BluetoothManager {
     final payload = Uint8List.sublistView(packet, 4, kPacketSize);
     _dsp.processBlock(
       rawBlock: payload,
-      rssiDbm: _currentRssi,
+      rssiDbm: _effectiveRssi,
       isLost: false,
       plcEnabled: signalSettings.plcEnabled,
       filterEnabled: signalSettings.filterEnabled,
@@ -1027,10 +1069,11 @@ class BluetoothManager {
     _aec.pushReference(clip); // referencia far-end para el cancelador de eco
 
     // Teoría de la Información (Cap. IV): capacidad de Shannon del canal
-    // (con el RSSI actual como proxy de SNR) y entropía de la fuente medida
-    // sobre el clip que se acaba de completar.
+    // (con el RSSI efectivo como proxy de SNR — si el canal degradado está
+    // forzado para la demo, la capacidad reportada baja coherentemente) y
+    // entropía de la fuente medida sobre el clip que se acaba de completar.
     final double capacityBps = InformationTheory.shannonCapacityBps(
-      rssiDbm: _currentRssi,
+      rssiDbm: _effectiveRssi,
       sampleRate: _rxSampleRate,
     );
     final double entropy = InformationTheory.sourceEntropyBitsPerSample(clip);
@@ -1042,14 +1085,15 @@ class BluetoothManager {
       timestamp: DateTime.now(),
     ));
 
-    final bool degraded = _currentRssi < kRssiWeakThreshold;
+    final bool degraded = _effectiveRssi < kRssiWeakThreshold;
+    final String forcedTag = forceDegradedChannel ? ' (forzado para demo)' : '';
     final String degradedNote = !degraded
         ? ''
         : signalSettings.filterEnabled
-            ? ' · canal degradado: AWGN inyectado + filtro IIR/FIR limpiando '
-                '(RSSI ${_currentRssi.toStringAsFixed(0)} dBm)'
-            : ' · canal degradado: AWGN inyectado SIN filtrar — filtro apagado '
-                '(RSSI ${_currentRssi.toStringAsFixed(0)} dBm)';
+            ? ' · canal degradado$forcedTag: AWGN inyectado + filtro IIR/FIR '
+                'limpiando (RSSI efectivo ${_effectiveRssi.toStringAsFixed(0)} dBm)'
+            : ' · canal degradado$forcedTag: AWGN inyectado SIN filtrar — filtro '
+                'apagado (RSSI efectivo ${_effectiveRssi.toStringAsFixed(0)} dBm)';
     _algorithmLogController.add(
       'Clip reproducido (${(clip.length / 1024).toStringAsFixed(1)} KB): '
       'H(X)=${entropy.toStringAsFixed(2)}/${maxEntropy.toStringAsFixed(0)} bits/muestra, '
@@ -1119,6 +1163,8 @@ class BluetoothManager {
     _txSeq = 0;
     _burstBuilder.clear();
     _sendChain = Future.value();
+    _burstsInFlight = 0;
+    _txBurstsDropped = 0;
     _aec.reset();
     _wasGatingMic = false;
     _lastSentBurstPcm = null;

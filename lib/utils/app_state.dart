@@ -101,6 +101,15 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Demo de canal degradado: fuerza AWGN + bit-errores simulados aunque la
+  /// señal real sea excelente (teléfonos juntos). Sin esto, en una demo a
+  /// corta distancia Filtro/FEC no tienen nada que corregir y "no se sienten".
+  bool get forceDegradedChannel => btManager.forceDegradedChannel;
+  void setForceDegradedChannel(bool enabled) {
+    btManager.forceDegradedChannel = enabled;
+    notifyListeners();
+  }
+
   /// Panel "Personalizar": ajusta una mitigación puntual sin tocar las demás.
   void setIndividualOptimization({
     bool? plc,
@@ -395,6 +404,7 @@ class AppState extends ChangeNotifier {
     // desde el panel "Optimizar señal" para poder sentir la diferencia.
     _signalSettings = SignalOptimizationSettings.raw;
     btManager.signalSettings = _signalSettings;
+    btManager.forceDegradedChannel = false;
     _isActive = true;
     notifyListeners();
     _listenToStreams();
