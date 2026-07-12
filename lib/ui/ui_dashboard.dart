@@ -1129,8 +1129,16 @@ class _RealtimeChartCard extends StatelessWidget {
       return FlSpot(p.timeSeconds, mapped);
     }).toList();
 
-    final minX = history.first.timeSeconds;
-    final maxX = history.last.timeSeconds;
+    // Min/max REALES sobre todos los puntos (no first/last): si el eje de
+    // tiempo llegara con puntos no monótonos, first/last invertirían el
+    // rango y fl_chart colapsa. Guardia adicional: rango nunca vacío.
+    double minX = history.first.timeSeconds;
+    double maxX = history.first.timeSeconds;
+    for (final p in history) {
+      minX = math.min(minX, p.timeSeconds);
+      maxX = math.max(maxX, p.timeSeconds);
+    }
+    if (maxX <= minX) maxX = minX + 1.0;
     final xRange = (maxX - minX).clamp(10.0, double.infinity);
 
     return LineChartData(

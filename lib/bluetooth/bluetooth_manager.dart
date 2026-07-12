@@ -54,9 +54,23 @@ const int kRssiPollIntervalMs = 5000;
 /// (a) cargaba el canal sin aportar nada y (b) mantenía el parlante del
 /// otro lado reproduciendo clips de silencio sin parar, lo que a su vez
 /// dejaba SU micrófono bloqueado en semi-dúplex permanente (con AEC
-/// activo). ~0.010 ≈ -40 dBFS: por encima del ruido de sala típico, por
-/// debajo de voz suave.
-const double kVadRmsThreshold = 0.010;
+/// activo). ~0.006 ≈ -44 dBFS: probado en campo — 0.010 recortaba
+/// fragmentos de voz suave.
+const double kVadRmsThreshold = 0.006;
+
+/// Hangover del VAD: cuántas ráfagas EXTRA se transmiten después de la
+/// última con voz. Sin esto el VAD cortaba "por fragmentos": una ráfaga de
+/// 2 s con la cola suave de una frase caía bajo el umbral y la frase
+/// llegaba amputada. Con hangover, al detectar voz se transmite hasta que
+/// el fragmento termine de verdad (una ráfaga silenciosa completa después
+/// de la última voz) — el mismo diseño de los VAD de telefonía.
+const int kVadHangoverBursts = 1;
+
+/// Cola del semi-dúplex (ms): el micrófono se mantiene silenciado un
+/// momento DESPUÉS de que el parlante termina, para no captar la
+/// reverberación de la sala ni el desinfle del control automático de
+/// ganancia — las colas de eco que se escapaban justo al liberar el gate.
+const int kAecGateHangoverMs = 300;
 
 /// Intervalo mínimo entre solicitudes de retransmisión (NACK). En un canal
 /// ya estresado, pedir reenvío por CADA hueco crea una espiral: reenvíos →
@@ -158,6 +172,11 @@ class BluetoothManager {
   // ── VAD (no transmitir silencio) ──────────────────────────────────────────
   bool _vadWasSilent = false;
   int _vadSkippedBursts = 0;
+  int _vadHangoverRemaining = 0;
+
+  /// Último instante (epoch ms) en que el parlante propio estuvo activo —
+  /// sostiene el gate del semi-dúplex durante [kAecGateHangoverMs] extra.
+  int _speakerActiveLastMs = 0;
 
   /// Estrés reciente del enlace (pérdidas + saturación TX), con decaimiento.
   /// Alimenta la simulación de RSSI: cuando la lectura real por GATT no está
@@ -530,7 +549,14 @@ class BluetoothManager {
     }
 
     final bool speakerActive = isSpeakerActive?.call() ?? false;
-    if (speakerActive) {
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (speakerActive) _speakerActiveLastMs = nowMs;
+    // El gate se sostiene kAecGateHangoverMs después de que el parlante
+    // calla: la reverberación de la sala y el AGC del micrófono siguen
+    // "escupiendo" eco un momento más allá del fin del clip.
+    final bool gated = speakerActive ||
+        (nowMs - _speakerActiveLastMs) < kAecGateHangoverMs;
+    if (gated) {
       if (!_wasGatingMic) {
         _algorithmLogController.add(
             'AEC: micrófono en semi-dúplex (silenciado mientras reproduce '
@@ -578,8 +604,22 @@ class BluetoothManager {
       // Ahorra el canal para quien SÍ está hablando y, de paso, evita que
       // el parlante del otro lado reproduzca silencio sin parar (lo que
       // mantenía su micrófono bloqueado en semi-dúplex — ver kVadRmsThreshold).
+      // Con HANGOVER: tras la última ráfaga con voz se transmite
+      // [kVadHangoverBursts] ráfaga(s) extra, para que el fragmento hablado
+      // termine completo en vez de amputarse cuando la cola de la frase cae
+      // bajo el umbral (reportado en campo como "detecta por fragmentos").
       final double rms = DspProcessor.rmsEnergy(burst);
-      if (rms < kVadRmsThreshold) {
+      final bool voiced = rms >= kVadRmsThreshold;
+      if (voiced) {
+        _vadHangoverRemaining = kVadHangoverBursts;
+        if (_vadWasSilent) {
+          _vadWasSilent = false;
+          _algorithmLogController
+              .add('VAD: voz detectada — transmitiendo de nuevo');
+        }
+      } else if (_vadHangoverRemaining > 0) {
+        _vadHangoverRemaining--; // cola de la frase: se envía igual
+      } else {
         _vadSkippedBursts++;
         if (!_vadWasSilent) {
           _vadWasSilent = true;
@@ -588,11 +628,6 @@ class BluetoothManager {
               '(RMS ${rms.toStringAsFixed(4)})');
         }
         continue;
-      }
-      if (_vadWasSilent) {
-        _vadWasSilent = false;
-        _algorithmLogController
-            .add('VAD: voz detectada — transmitiendo de nuevo');
       }
 
       if (_burstsInFlight >= _kMaxBurstsInFlight) {
@@ -1301,6 +1336,8 @@ class BluetoothManager {
     _txBurstsDropped = 0;
     _vadWasSilent = false;
     _vadSkippedBursts = 0;
+    _vadHangoverRemaining = 0;
+    _speakerActiveLastMs = 0;
     _aec.reset();
     _wasGatingMic = false;
     _lastSentBurstPcm = null;

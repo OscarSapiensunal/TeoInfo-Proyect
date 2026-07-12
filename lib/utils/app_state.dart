@@ -335,6 +335,7 @@ class AppState extends ChangeNotifier {
   /// seleccionado en cuanto alguien se conecte; en caso contrario, habla por
   /// su propio micrófono (si [micEnabled]) y escucha lo que le llegue.
   Future<void> waitForConnection() async {
+    if (_isActive) return; // doble tap / reentrada: ya hay sesión en curso
     if (_wavLabMode && (_wavFilePath == null || _wavHeader == null)) {
       _statusMessage = 'Selecciona un archivo .wav primero';
       notifyListeners();
@@ -359,6 +360,7 @@ class AppState extends ChangeNotifier {
   /// Se conecta directamente al dispositivo [device] (emparejando primero
   /// si hace falta) y comienza la sesión de inmediato.
   Future<void> connectToDevice(BtDeviceInfo device) async {
+    if (_isActive) return; // doble tap / reentrada: ya hay sesión en curso
     final granted = await requestAllPermissions();
     if (!granted) return;
     if (!await _ensureBluetoothOn()) return;
@@ -385,13 +387,25 @@ class AppState extends ChangeNotifier {
         micEnabled: _micEnabled,
       );
     } catch (e) {
-      _isActive = false;
+      // Desmontar la sesión COMPLETA (suscripciones incluidas), no solo el
+      // flag: dejar suscripciones vivas aquí era el origen de los listeners
+      // duplicados al reintentar la conexión.
+      await stopSession();
       _statusMessage = 'No se pudo conectar a ${device.name}: $e';
       notifyListeners();
     }
   }
 
   Future<void> _beginActiveSession() async {
+    // CRÍTICO: cancelar cualquier suscripción previa ANTES de volver a
+    // suscribirse. Si un intento de conexión fallaba (o se reintentaba),
+    // las suscripciones viejas quedaban vivas y se sumaban a las nuevas:
+    // cada clip de audio recibido se encolaba N veces al reproductor
+    // (reproducirlo todo N veces = consumo N× más lento que la llegada →
+    // la latencia SOLO podía explotar, sin importar el ancho de banda), y
+    // _sessionStart se reseteaba en caliente (la gráfica "iba y volvía"
+    // en el tiempo). Confirmado en campo con ambos síntomas a la vez.
+    await _cancelStreamSubs();
     _sessionStart = DateTime.now();
     _chartHistory.clear();
     _latencyLog.clear();
@@ -494,8 +508,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> stopSession() async {
-    _isActive = false; _isConnected = false;
+  /// Cancela y anula TODAS las suscripciones a los streams del manager.
+  /// Único punto de limpieza — lo usan stopSession() y _beginActiveSession()
+  /// (este último para garantizar que nunca haya suscripciones duplicadas).
+  Future<void> _cancelStreamSubs() async {
     await _metricsSub?.cancel();
     await _audioChunkSub?.cancel();
     await _statusSub?.cancel();
@@ -505,6 +521,11 @@ class AppState extends ChangeNotifier {
     _metricsSub = null; _audioChunkSub = null;
     _statusSub = null;  _latencySub = null;
     _infoTheorySub = null; _algorithmLogSub = null;
+  }
+
+  Future<void> stopSession() async {
+    _isActive = false; _isConnected = false;
+    await _cancelStreamSubs();
     await btManager.disconnect();
     await audioPlayer.stopStreaming();
     await SystemChannel.keepScreenOn(false);
