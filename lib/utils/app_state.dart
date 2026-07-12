@@ -219,15 +219,32 @@ class AppState extends ChangeNotifier {
   }
 
   // ── Gestión Bluetooth: activar / visible / escanear / emparejar ──────────
+
+  /// Se asegura de que el Bluetooth esté encendido ANTES de intentar
+  /// escanear/conectar — si está apagado, dispara el diálogo nativo para
+  /// activarlo y espera su resultado. Si el usuario lo rechaza (o falla),
+  /// dejar el flujo de conexión seguir de largo solo produce fallos
+  /// silenciosos más adelante (sin mensaje claro de por qué); por eso todo
+  /// punto de entrada (escanear, esperar conexión, conectar) llama esto
+  /// primero y aborta con un mensaje de estado si sigue apagado.
+  Future<bool> _ensureBluetoothOn() async {
+    final enabled = await btManager.requestEnable();
+    if (!enabled) {
+      _statusMessage = 'Bluetooth desactivado — actívalo para continuar';
+      notifyListeners();
+    }
+    return enabled;
+  }
+
   Future<void> enableBluetooth() async {
     final granted = await requestAllPermissions();
     if (!granted) return;
-    final enabled = await btManager.requestEnable();
-    _statusMessage = enabled
-        ? 'Bluetooth activado'
-        : 'No se pudo activar el Bluetooth';
-    notifyListeners();
-    if (enabled) await _refreshPairedDevices();
+    final enabled = await _ensureBluetoothOn();
+    if (enabled) {
+      _statusMessage = 'Bluetooth activado';
+      notifyListeners();
+      await _refreshPairedDevices();
+    }
   }
 
   Future<void> makeDiscoverable() async {
@@ -239,6 +256,7 @@ class AppState extends ChangeNotifier {
   Future<void> startScan() async {
     final granted = await requestAllPermissions();
     if (!granted) return;
+    if (!await _ensureBluetoothOn()) return;
     await stopScan();
 
     // Conservar emparejados; limpiar descubiertos previos
@@ -310,9 +328,9 @@ class AppState extends ChangeNotifier {
     }
     final granted = await requestAllPermissions();
     if (!granted) return;
+    if (!await _ensureBluetoothOn()) return;
 
     await stopScan();
-    await btManager.requestEnable();
     await btManager.requestDiscoverable();
     await _beginActiveSession();
 
@@ -329,6 +347,7 @@ class AppState extends ChangeNotifier {
   Future<void> connectToDevice(BtDeviceInfo device) async {
     final granted = await requestAllPermissions();
     if (!granted) return;
+    if (!await _ensureBluetoothOn()) return;
     await stopScan();
 
     if (!device.bonded) {
@@ -426,10 +445,21 @@ class AppState extends ChangeNotifier {
     });
   }
 
+  /// El estadístico "última latencia"/"promedio" que se muestra en la UI
+  /// SOLO usa el RTT (medido enteramente con el reloj del propio emisor —
+  /// ver LatencyMetric.isRoundTrip). El "tránsito" que reporta el receptor
+  /// resta timestamps de DOS relojes distintos (emisor y receptor); si esos
+  /// relojes no están sincronizados, el resultado puede ser disparatado
+  /// (segundos u órdenes de magnitud de más) sin que eso sea un fallo del
+  /// DSP — es un problema de reloj, no de latencia real. Por eso el tránsito
+  /// solo se registra en el log (con su propia etiqueta), nunca en el
+  /// número principal.
   void _onLatencyMetric(LatencyMetric m) {
-    _lastLatencyMs = m.latencyMs;
-    _latencySumMs += m.latencyMs;
-    _burstCount++;
+    if (m.isRoundTrip) {
+      _lastLatencyMs = m.latencyMs;
+      _latencySumMs += m.latencyMs;
+      _burstCount++;
+    }
 
     final t = m.timestamp;
     final hh = t.hour.toString().padLeft(2, '0');

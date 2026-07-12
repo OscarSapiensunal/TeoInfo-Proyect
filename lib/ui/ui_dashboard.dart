@@ -12,11 +12,12 @@
 //   6. Botón de finalizar sesión (solo mientras está activa).
 // ─────────────────────────────────────────────────────────────────────────────
 
+import 'dart:math' as math;
+
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../dsp/information_theory.dart';
 import '../models/app_models.dart';
 import '../utils/app_state.dart';
 
@@ -509,9 +510,9 @@ class _SignalOptimizationCard extends StatelessWidget {
     final s = state.signalSettings;
     final String subtitle;
     if (s.allEnabled) {
-      subtitle = 'Optimizada: las 5 mitigaciones activas';
+      subtitle = 'Optimizada (con las 5 mejoras activas)';
     } else if (s.allDisabled) {
-      subtitle = 'Cruda: sin ninguna mitigación (así llega el canal real)';
+      subtitle = 'Sin optimizar (la señal tal cual llega, sin mejoras)';
     } else {
       final active = [
         s.plcEnabled,
@@ -520,7 +521,7 @@ class _SignalOptimizationCard extends StatelessWidget {
         s.fecEnabled,
         s.arqEnabled,
       ].where((v) => v).length;
-      subtitle = 'Personalizado: $active/5 mitigaciones activas';
+      subtitle = 'Personalizado ($active de 5 mejoras activas)';
     }
 
     return _Card(
@@ -652,11 +653,18 @@ class _LatencyCard extends StatelessWidget {
       title: 'LATENCIA DE TRANSMISIÓN POR RÁFAGA',
       icon: Icons.timer_outlined,
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          const Text(
+            'Ida y vuelta medida con el reloj del propio emisor (no se ve '
+            'afectada si los dos teléfonos no tienen el reloj sincronizado)',
+            style: TextStyle(color: _C.textMuted, fontSize: 10),
+          ),
+          const SizedBox(height: 8),
           Row(
             children: [
               _MetricTile(
-                label: 'ÚLT. LATENCIA',
+                label: 'ÚLT. LATENCIA (RTT)',
                 value: state.lastLatencyMs != null
                     ? '${state.lastLatencyMs!.toStringAsFixed(0)} ms'
                     : '—',
@@ -665,7 +673,7 @@ class _LatencyCard extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               _MetricTile(
-                label: 'PROMEDIO',
+                label: 'PROMEDIO (RTT)',
                 value: state.avgLatencyMs != null
                     ? '${state.avgLatencyMs!.toStringAsFixed(0)} ms'
                     : '—',
@@ -856,7 +864,7 @@ class _InfoTheoryCard extends StatelessWidget {
     final info = state.infoTheory;
 
     return _Card(
-      title: 'TEORÍA DE LA INFORMACIÓN',
+      title: 'CAPACIDAD DEL CANAL',
       icon: Icons.insights_rounded,
       child: info == null
           ? const Text(
@@ -864,11 +872,12 @@ class _InfoTheoryCard extends StatelessWidget {
               style: TextStyle(color: _C.textMuted, fontSize: 12),
             )
           : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
                   children: [
                     _MetricTile(
-                      label: 'CAPACIDAD C',
+                      label: 'MÁXIMO TEÓRICO (C)',
                       value:
                           '${(info.channelCapacityBps / 1000).toStringAsFixed(1)} kbps',
                       icon: Icons.swap_vert_rounded,
@@ -876,7 +885,7 @@ class _InfoTheoryCard extends StatelessWidget {
                     ),
                     const SizedBox(width: 10),
                     _MetricTile(
-                      label: 'ENTROPÍA H(X)',
+                      label: 'ENTROPÍA (H)',
                       value:
                           '${info.sourceEntropyBitsPerSample.toStringAsFixed(2)} bits',
                       icon: Icons.scatter_plot_rounded,
@@ -885,11 +894,20 @@ class _InfoTheoryCard extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 8),
+                const Text(
+                  'Máximo teórico (C): cuántos datos por segundo podría '
+                  'soportar el canal ahora mismo según la calidad de la '
+                  'señal — no es lo que se está usando, es el techo '
+                  '(fórmula de Shannon).',
+                  style: TextStyle(color: _C.textMuted, fontSize: 10),
+                ),
+                const SizedBox(height: 4),
                 Text(
-                  'C = B·log2(1+SNR) con B = Nyquist del muestreo y SNR relativo al '
-                  'piso de ruido asumido (${InformationTheory.kAssumedNoiseFloorDbm.toStringAsFixed(0)} dBm). '
-                  'H(X) máxima con 256 bins: ${info.maxEntropyBitsPerSample.toStringAsFixed(0)} bits/muestra '
-                  '(ruido blanco uniforme); la voz real siempre da menos.',
+                  'Entropía (H): qué tan "impredecible" es tu voz comparada '
+                  'con puro ruido — cuanto más alto, más se parece a ruido '
+                  'puro (máximo con esta medición: '
+                  '${info.maxEntropyBitsPerSample.toStringAsFixed(0)} bits). '
+                  'La voz real siempre da menos, por sus silencios y patrones.',
                   style: const TextStyle(color: _C.textMuted, fontSize: 10),
                 ),
               ],
@@ -1047,18 +1065,33 @@ class _RealtimeChartCard extends StatelessWidget {
   }
 
   LineChartData _buildChartData(List<ChartDataPoint> history) {
-    // ── Series de RSSI (eje Y izquierdo: -100 a -30 dBm) ─────────────────
+    // ── Rango vertical dinámico según el RSSI real de la sesión ──────────
+    // Antes el eje estaba fijo en -100..-30 dBm; un RSSI real (lectura GATT,
+    // no acotada como el respaldo simulado) fuera de ese rango simplemente
+    // se salía del cuadro. Se calcula a partir de los datos, con margen y
+    // un ancho mínimo para que no se vea como una línea plana.
+    final rssiValues = history.map((p) => p.rssiDbm);
+    final double dataMin = rssiValues.reduce(math.min);
+    final double dataMax = rssiValues.reduce(math.max);
+    double minY = (dataMin - 5).floorToDouble();
+    double maxY = (dataMax + 5).ceilToDouble();
+    if (maxY - minY < 20) {
+      final double mid = (minY + maxY) / 2;
+      minY = mid - 10;
+      maxY = mid + 10;
+    }
+    final double yRange = maxY - minY;
+
+    // ── Series de RSSI ─────────────────────────────────────────────────
     final rssiSpots = history
         .map((p) => FlSpot(p.timeSeconds, p.rssiDbm))
         .toList();
 
     // ── Series de Packet Loss (eje Y derecho: 0–100%) ─────────────────────
-    // Normalizamos packet loss al rango -100…-30 para superponerlo visualmente
-    // en el mismo eje (escala secundaria visual).
-    // Fórmula: rssiRange = 70 dBm → loss% → dBm equivalente
+    // Se normaliza sobre el MISMO rango dinámico del RSSI, para
+    // superponerlas visualmente en un solo eje.
     final lossSpots = history.map((p) {
-      // Mapear 0–100% → -100…-30 dBm para comparación visual en misma escala
-      final mapped = -100.0 + (p.packetLossPercent / 100.0) * 70.0;
+      final mapped = minY + (p.packetLossPercent / 100.0) * yRange;
       return FlSpot(p.timeSeconds, mapped);
     }).toList();
 
@@ -1088,7 +1121,7 @@ class _RealtimeChartCard extends StatelessWidget {
           sideTitles: SideTitles(
             showTitles: true,
             reservedSize: 36,
-            interval: 14,
+            interval: (yRange / 5).clamp(2.0, double.infinity),
             getTitlesWidget: (value, _) => Text(
               value.toInt().toString(),
               style: const TextStyle(color: _C.textMuted, fontSize: 9, fontFamily: 'monospace'),
@@ -1100,10 +1133,10 @@ class _RealtimeChartCard extends StatelessWidget {
           sideTitles: SideTitles(
             showTitles: true,
             reservedSize: 36,
-            interval: 14,
+            interval: (yRange / 5).clamp(2.0, double.infinity),
             getTitlesWidget: (value, _) {
-              // Invertir mapeo: dBm → %
-              final pct = ((value + 100.0) / 70.0 * 100.0).clamp(0.0, 100.0);
+              // Invertir mapeo: dBm (rango dinámico) → %
+              final pct = ((value - minY) / yRange * 100.0).clamp(0.0, 100.0);
               return Text(
                 '${pct.toInt()}%',
                 style: const TextStyle(color: _C.accentRed, fontSize: 9, fontFamily: 'monospace'),
@@ -1126,8 +1159,8 @@ class _RealtimeChartCard extends StatelessWidget {
       ),
       minX: minX,
       maxX: maxX,
-      minY: -100,
-      maxY: -30,
+      minY: minY,
+      maxY: maxY,
       lineBarsData: [
         // ── Línea RSSI ───────────────────────────────────────────────────
         LineChartBarData(
@@ -1168,7 +1201,7 @@ class _RealtimeChartCard extends StatelessWidget {
               return LineTooltipItem(
                 isRssi
                     ? '${spot.y.toStringAsFixed(1)} dBm'
-                    : '${((spot.y + 100.0) / 70.0 * 100.0).toStringAsFixed(1)}%',
+                    : '${((spot.y - minY) / yRange * 100.0).toStringAsFixed(1)}%',
                 TextStyle(
                   color: isRssi ? _C.rssiLine : _C.lossLine,
                   fontSize: 11,
