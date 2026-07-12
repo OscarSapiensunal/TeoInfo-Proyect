@@ -63,6 +63,7 @@ Conceptos del curso directamente aplicados:
 |---|---|
 | **Teorema de muestreo** (Cap. III 3.1) | La voz se muestrea a 8 kHz: el ancho de banda útil de la voz telefónica (~300–3400 Hz) queda por debajo de Nyquist (4 kHz) — la misma decisión de diseño de la telefonía clásica, tomada aquí para que la tasa de la fuente quepa en el throughput real del canal (ver dificultad 12). |
 | **PCM no uniforme — companding μ-law, G.711** (Cap. III 3.2) | Cada muestra se comprime de 16 a 8 bits con cuantización logarítmica implementada a mano (`companding.dart`): paso fino cerca de cero (donde vive la voz y el oído distingue) y grueso en amplitudes altas. Junto con los 8 kHz, reduce la fuente 4× (32→8 KB/s por dirección). |
+| **VAD — detección de actividad de voz** (detector de energía) | Cada ráfaga se mide con su energía RMS antes de salir al aire; por debajo del umbral (~-40 dBFS) se considera silencio y NO se transmite. En una conversación real cada lado habla menos de la mitad del tiempo: sin VAD el sistema enviaba 8 KB/s de silencio codificado de forma continua, y ese silencio, al reproducirse en el otro teléfono, mantenía su micrófono bloqueado en semi-dúplex permanente (ver dificultad 12). |
 | **PCM — Modulación por codificación de pulsos** (Cap. III 3.2) | Cuantización uniforme a 16 bits por muestra, mono. El flujo se transmite sin compresión precisamente para analizar la señal "pura". |
 | **Transmisión digital de señales analógicas** (Cap. III) | Pipeline completo: micrófono (analógico) → ADC → empaquetado → canal → DAC → parlante. |
 | **Canal ruidoso** (Cap. IV 4.4) | El canal Bluetooth real presenta pérdida de paquetes y desvanecimiento con la distancia; la app lo cuantifica (loss %) en vez de simularlo. |
@@ -95,6 +96,7 @@ Conceptos del curso directamente aplicados:
 | Lectura de RSSI real vía GATT sobre BT Clásico (con *fallback* simulado si el teléfono no la soporta) | **Propio** (`MainActivity.kt` + `rssi_channel.dart`) |
 | FEC — Hamming (7,4), codificación/decodificación/corrección | **Propio** (`error_correction.dart`) |
 | Companding μ-law (G.711) — PCM logarítmico 16→8 bits | **Propio** (`companding.dart`) |
+| VAD — detector de actividad de voz por energía RMS | **Propio** (`bluetooth_manager.dart` + `dsp_processor.rmsEnergy`) |
 | ARQ — protocolo NACK + caché de última ráfaga + reenvío | **Propio** (`app_models.dart` + `bluetooth_manager.dart`) |
 | Socket Bluetooth cliente | Librería `flutter_bluetooth_serial` |
 | Acceso a micrófono y parlante (drivers de audio) | Librería `flutter_sound` |
@@ -496,6 +498,27 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    latencia se estabiliza en vez de crecer. Es el ciclo completo de
    ingeniería del curso: medir el canal → detectar que la fuente lo excede
    → recodificar la fuente (Cap. III) para que quepa (Cap. IV).
+12. **Activar las optimizaciones EMPEORABA la congestión.** Tras la
+   adaptación de tasa, la saturación tardaba ~4× más pero seguía llegando,
+   y paradójicamente se aceleraba al encender "Optimizar señal". Tres
+   causas encadenadas, todas confirmadas en campo: (a) **se transmitía
+   silencio** — sin VAD, cada micrófono activo enviaba su tasa completa
+   24/7 aunque nadie hablara (la recuperación instantánea al silenciar el
+   micrófono fue la pista clave); (b) ese silencio, reproducido sin pausa
+   en el otro teléfono, mantenía `isSpeakerActive` siempre en true y con
+   AEC activo **bloqueaba el micrófono ajeno en semi-dúplex permanente**
+   (la voz "se cortaba bruscamente"); (c) el ARQ pedía reenvío por CADA
+   hueco y el reenvío no respetaba el backpressure: sobre un canal ya
+   estresado, cada retransmisión generaba más pérdidas que a su vez
+   generaban más retransmisiones — el colapso por congestión clásico que
+   motivó el control de congestión de TCP. Soluciones: VAD por energía
+   RMS (el silencio no viaja), NACK con intervalo mínimo de 2 s, y
+   reenvíos sujetos al mismo límite de ráfagas en vuelo que el audio
+   fresco. Además el RSSI simulado dejó de ser un paseo aleatorio ciego:
+   ahora persigue un objetivo derivado de las pérdidas/saturación
+   recientes, de modo que el indicador (aunque marcado como simulado) se
+   mueve CON el canal en vez de mostrar una señal "sana" mientras el
+   enlace agoniza.
 
 1. Se implementó un sistema de comunicación digital de voz funcional de
    extremo a extremo sobre un canal inalámbrico real, cumpliendo el objetivo

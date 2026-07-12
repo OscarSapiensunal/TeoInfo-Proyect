@@ -42,9 +42,27 @@ import 'rssi_channel.dart';
 const int kPacketIntervalMs = 11;
 
 /// Período de consulta de RSSI (ms). Cada lectura real implica una conexión
-/// GATT completa (conectar → leer → cerrar, ~0.5-1.5 s), así que sondear
-/// más rápido solo apila conexiones sin ganar resolución útil.
-const int kRssiPollIntervalMs = 2000;
+/// GATT completa (conectar → leer → cerrar, ~0.5-1.5 s) que además COMPITE
+/// por la radio con el enlace RFCOMM de audio — sondear seguido no solo no
+/// gana resolución: le roba ancho de banda a la voz.
+const int kRssiPollIntervalMs = 5000;
+
+/// Umbral de energía RMS (normalizada 0-1) por debajo del cual una ráfaga
+/// se considera silencio y NO se transmite (VAD — detección de actividad
+/// de voz por energía). Sin esto, cada teléfono con micrófono activo
+/// enviaba 8 KB/s CONSTANTES aunque nadie hablara: silencio codificado que
+/// (a) cargaba el canal sin aportar nada y (b) mantenía el parlante del
+/// otro lado reproduciendo clips de silencio sin parar, lo que a su vez
+/// dejaba SU micrófono bloqueado en semi-dúplex permanente (con AEC
+/// activo). ~0.010 ≈ -40 dBFS: por encima del ruido de sala típico, por
+/// debajo de voz suave.
+const double kVadRmsThreshold = 0.010;
+
+/// Intervalo mínimo entre solicitudes de retransmisión (NACK). En un canal
+/// ya estresado, pedir reenvío por CADA hueco crea una espiral: reenvíos →
+/// más carga → más huecos → más reenvíos (colapso por congestión, el mismo
+/// fenómeno que motivó el control de congestión de TCP).
+const int kMinNackIntervalMs = 2000;
 
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo.
 /// DEBE cubrir al menos 2 ráfagas completas: una ráfaga entera puede
@@ -135,6 +153,18 @@ class BluetoothManager {
   final Set<int> _recentlyLostSeqs = {};
   static const int _kMaxTrackedLostSeqs = 256;
   int _totalPacketsRecovered = 0;
+  int _lastNackEpochMs = 0;
+
+  // ── VAD (no transmitir silencio) ──────────────────────────────────────────
+  bool _vadWasSilent = false;
+  int _vadSkippedBursts = 0;
+
+  /// Estrés reciente del enlace (pérdidas + saturación TX), con decaimiento.
+  /// Alimenta la simulación de RSSI: cuando la lectura real por GATT no está
+  /// disponible, el valor simulado persigue la salud REAL observable del
+  /// enlace en vez de pasearse aleatoriamente mostrando una señal "sana"
+  /// mientras el canal agoniza.
+  double _recentLinkStress = 0.0;
 
   // ── Estado de RX (formato de audio entrante y reproducción) ──────────────
   int _rxSampleRate = kMicSampleRate;
@@ -544,13 +574,40 @@ class BluetoothManager {
         _burstBuilder.add(Uint8List.sublistView(all, kBurstPcmBytes));
       }
 
+      // ── VAD: el silencio no se transmite ─────────────────────────────
+      // Ahorra el canal para quien SÍ está hablando y, de paso, evita que
+      // el parlante del otro lado reproduzca silencio sin parar (lo que
+      // mantenía su micrófono bloqueado en semi-dúplex — ver kVadRmsThreshold).
+      final double rms = DspProcessor.rmsEnergy(burst);
+      if (rms < kVadRmsThreshold) {
+        _vadSkippedBursts++;
+        if (!_vadWasSilent) {
+          _vadWasSilent = true;
+          _algorithmLogController.add(
+              'VAD: silencio — se deja de transmitir hasta detectar voz '
+              '(RMS ${rms.toStringAsFixed(4)})');
+        }
+        continue;
+      }
+      if (_vadWasSilent) {
+        _vadWasSilent = false;
+        _algorithmLogController
+            .add('VAD: voz detectada — transmitiendo de nuevo');
+      }
+
       if (_burstsInFlight >= _kMaxBurstsInFlight) {
         _txBurstsDropped++;
+        _recentLinkStress += 4.0; // saturación propia también es estrés
         _log.w('TX saturado: ráfaga descartada '
             '($_txBurstsDropped descartadas en total)');
-        _algorithmLogController.add(
-            'Backpressure: canal saturado → ráfaga de voz descartada en el '
-            'emisor (no se acumula atraso)');
+        // Solo la 1ª y luego cada 5ª: bajo saturación sostenida este evento
+        // se dispara seguido y el spam de log (con su notifyListeners por
+        // línea) le quitaría CPU justo al teléfono que ya va ahogado.
+        if (_txBurstsDropped == 1 || _txBurstsDropped % 5 == 0) {
+          _algorithmLogController.add(
+              'Backpressure: canal saturado → ráfaga descartada en el emisor '
+              '($_txBurstsDropped en total; no se acumula atraso)');
+        }
         continue;
       }
 
@@ -854,14 +911,27 @@ class BluetoothManager {
       if (_lastSentBurstId == req.burstId &&
           _lastSentBurstPcm != null &&
           _lastSentBurstStartSeq != null) {
+        // El reenvío también respeta el backpressure: retransmitir sobre un
+        // canal ya saturado solo profundiza la congestión que causó la
+        // pérdida original — mejor dejar que el PLC del receptor cubra ese
+        // hueco y conservar el canal para el audio fresco.
+        if (_burstsInFlight >= _kMaxBurstsInFlight) {
+          _algorithmLogController.add(
+              'ARQ: reenvío de ráfaga #${req.burstId} IGNORADO — canal '
+              'saturado (retransmitir empeoraría la congestión)');
+          return;
+        }
         _algorithmLogController.add(
             'ARQ: solicitud de reenvío para ráfaga #${req.burstId} → reenviando');
         final pcm = _lastSentBurstPcm!;
         final startSeq = _lastSentBurstStartSeq!;
+        _burstsInFlight++;
         _sendChain = _sendChain
             .then((_) => _resendBurstPackets(req.burstId, pcm, startSeq))
             .catchError((Object e) {
           _log.w('ARQ: error reenviando ráfaga #${req.burstId}: $e');
+        }).whenComplete(() {
+          if (_burstsInFlight > 0) _burstsInFlight--;
         });
       } else {
         _log.d('ARQ: ráfaga #${req.burstId} ya no está en caché, se ignora');
@@ -936,6 +1006,7 @@ class BluetoothManager {
           lostInGap = kMaxConsecutiveLostPackets;
         }
         _totalPacketsLost += lostInGap;
+        _recentLinkStress += lostInGap.toDouble();
         _log.w('Pérdida detectada: seq esperada=$expected recibida=$seqNum '
             'perdidos=$lostInGap');
         _algorithmLogController.add(signalSettings.plcEnabled
@@ -951,12 +1022,20 @@ class BluetoothManager {
           while (_recentlyLostSeqs.length > _kMaxTrackedLostSeqs) {
             _recentlyLostSeqs.remove(_recentlyLostSeqs.first);
           }
-          _algorithmLogController
-              .add('ARQ: solicitando reenvío de la ráfaga #$_rxBurstId');
-          unawaited(_txWrite(buildNackPacket(burstId: _rxBurstId!))
-              .catchError((Object e) {
-            _log.w('No se pudo enviar NACK: $e');
-          }));
+          // Disciplina anti-congestión: como mucho un NACK cada
+          // kMinNackIntervalMs — pedir reenvío por CADA hueco en un canal
+          // ya estresado realimenta la congestión (reenvíos → más carga →
+          // más huecos → más reenvíos) en vez de corregirla.
+          final int nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - _lastNackEpochMs >= kMinNackIntervalMs) {
+            _lastNackEpochMs = nowMs;
+            _algorithmLogController
+                .add('ARQ: solicitando reenvío de la ráfaga #$_rxBurstId');
+            unawaited(_txWrite(buildNackPacket(burstId: _rxBurstId!))
+                .catchError((Object e) {
+              _log.w('No se pudo enviar NACK: $e');
+            }));
+          }
         }
 
         for (int i = 0; i < lostInGap; i++) {
@@ -1171,13 +1250,21 @@ class BluetoothManager {
           _rssiIsReal = true;
         } catch (_) {
           _rssiIsReal = false;
-          // Paseo aleatorio acotado: cada tick se mueve entre -1.0 y +1.0 dBm,
-          // manteniéndose dentro de un rango físicamente razonable. A
-          // diferencia del bug anterior (que solo restaba), esto sí sube y
-          // baja, simulando fluctuación real del canal en vez de una rampa
-          // monótona hacia el piso.
-          final double step = (_rssiRng.nextDouble() * 2.0) - 1.0;
-          _currentRssi = (_currentRssi + step).clamp(-95.0, -40.0);
+          // Simulación guiada por la salud REAL del enlace: el valor
+          // persigue un objetivo derivado de las pérdidas y la saturación
+          // TX recientes (_recentLinkStress, con decaimiento), más un poco
+          // de ruido. El paseo aleatorio ciego anterior mostraba una señal
+          // "sana" paseándose por -60 dBm mientras el enlace agonizaba —
+          // un indicador que no indica nada. Así, aunque el número siga
+          // siendo simulado (y la UI lo marque como tal), al menos SE MUEVE
+          // CON el canal: enlace limpio → ~-48 dBm; pérdidas/saturación →
+          // cae proporcionalmente; se recupera cuando el canal se limpia.
+          _recentLinkStress *= 0.6; // decae si no hay eventos nuevos
+          final double target =
+              (-48.0 - _recentLinkStress * 2.0).clamp(-92.0, -45.0);
+          final double noise = (_rssiRng.nextDouble() * 2.0) - 1.0;
+          _currentRssi = (_currentRssi + (target - _currentRssi) * 0.4 + noise)
+              .clamp(-95.0, -40.0);
         } finally {
           _rssiPollBusy = false;
         }
@@ -1197,6 +1284,8 @@ class BluetoothManager {
     _totalPacketsRecovered = 0;
     _recentlyLostSeqs.clear();
     _rxIsMuLaw = false;
+    _lastNackEpochMs = 0;
+    _recentLinkStress = 0.0;
     _rxBurstId = null;
     _rxBurstTxEpochMs = null;
     _rxBurstBytesRemaining = 0;
@@ -1210,6 +1299,8 @@ class BluetoothManager {
     _sendChain = Future.value();
     _burstsInFlight = 0;
     _txBurstsDropped = 0;
+    _vadWasSilent = false;
+    _vadSkippedBursts = 0;
     _aec.reset();
     _wasGatingMic = false;
     _lastSentBurstPcm = null;
