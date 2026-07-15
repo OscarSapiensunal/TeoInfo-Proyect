@@ -58,13 +58,12 @@ const int kRssiPollIntervalMs = 5000;
 /// fragmentos de voz suave.
 const double kVadRmsThreshold = 0.006;
 
-/// Hangover del VAD: cuántas ráfagas EXTRA se transmiten después de la
-/// última con voz. Sin esto el VAD cortaba "por fragmentos": una ráfaga de
-/// 2 s con la cola suave de una frase caía bajo el umbral y la frase
-/// llegaba amputada. Con hangover, al detectar voz se transmite hasta que
-/// el fragmento termine de verdad (una ráfaga silenciosa completa después
-/// de la última voz) — el mismo diseño de los VAD de telefonía.
-const int kVadHangoverBursts = 1;
+/// Hangover del VAD: cuántos frames EXTRA (~128 ms c/u) se transmiten
+/// después del último con voz. Sin esto el VAD cortaba "por fragmentos":
+/// la cola suave de una frase caía bajo el umbral y llegaba amputada. Con
+/// hangover, al detectar voz se transmite hasta que el fragmento termine
+/// de verdad (~0.5 s de gracia) — el mismo diseño de los VAD de telefonía.
+const int kVadHangoverFrames = 4;
 
 /// Cola del semi-dúplex (ms): el micrófono se mantiene silenciado un
 /// momento DESPUÉS de que el parlante termina, para no captar la
@@ -72,27 +71,14 @@ const int kVadHangoverBursts = 1;
 /// ganancia — las colas de eco que se escapaban justo al liberar el gate.
 const int kAecGateHangoverMs = 300;
 
-/// Intervalo mínimo entre solicitudes de retransmisión (NACK). En un canal
-/// ya estresado, pedir reenvío por CADA hueco crea una espiral: reenvíos →
-/// más carga → más huecos → más reenvíos (colapso por congestión, el mismo
-/// fenómeno que motivó el control de congestión de TCP).
-const int kMinNackIntervalMs = 2000;
 
-/// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo.
-/// DEBE cubrir al menos 2 ráfagas completas: una ráfaga entera puede
-/// perderse de golpe, y con un tope menor que eso el conteo además rompe la
-/// ventana del ARQ (ver kArqRecoveryWindowPackets). Con μ-law una ráfaga
-/// son 16 paquetes de aire, así que 126 cubre con margen de sobra.
+/// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo
+/// (protege los contadores ante un SEQ corrupto que parezca un salto gigante).
 const int kMaxConsecutiveLostPackets = 126;
 
-/// Ventana hacia atrás (en números de secuencia) dentro de la cual un
-/// paquete "atrasado" se interpreta como retransmisión ARQ y no como un
-/// salto gigante hacia adelante. Debe ser MAYOR que el máximo de pérdidas
-/// contabilizables de una vez: si fuera menor (bug original: 50 < 63
-/// paquetes por ráfaga), la retransmisión de una ráfaga completa caería al
-/// detector de pérdidas y se contaría como un falso salto adelante de
-/// decenas de miles de paquetes.
-const int kArqRecoveryWindowPackets = 128;
+/// Período del PING de medición de latencia (ms) — ver PING/PONG en
+/// app_models.dart: 12 bytes cada 2 s, despreciable para el canal.
+const int kPingIntervalMs = 2000;
 
 /// UUID del perfil SPP (Serial Port Profile) — estándar Bluetooth Classic.
 const String kSppUuid = '00001101-0000-1000-8000-00805F9B34FB';
@@ -117,8 +103,7 @@ class BluetoothManager {
 
   // ── Estado de TX (captura y envío del micrófono propio) ──────────────────
   StreamSubscription<Uint8List>? _pcmSub;
-  final BytesBuilder _burstBuilder = BytesBuilder(copy: true);
-  int _txBurstId = 0;
+  final BytesBuilder _frameBuilder = BytesBuilder(copy: true);
   int _txSeq = 0;
   Future<void> _sendChain = Future.value();
 
@@ -152,22 +137,9 @@ class BluetoothManager {
   double get _effectiveRssi =>
       forceDegradedChannel ? math.min(_currentRssi, -85.0) : _currentRssi;
 
-  // ── Estado de ARQ (retransmisión de ráfagas a pedido) ─────────────────────
-  Uint8List? _lastSentBurstPcm;
-  int? _lastSentBurstId;
-  int? _lastSentBurstStartSeq;
-
-  /// SEQs marcados como perdidos recientemente, a la espera de una posible
-  /// retransmisión. NO se limpia al llegar la siguiente cabecera de ráfaga:
-  /// el reenvío viaja encolado detrás de la ráfaga en curso del emisor y es
-  /// normal que llegue DESPUÉS de que la siguiente ráfaga ya empezó — solo
-  /// la ventana de secuencia ([kArqRecoveryWindowPackets]) decide si un SEQ
-  /// atrasado sigue siendo recuperable. Con tope para no crecer sin límite
-  /// en sesiones largas con muchas pérdidas nunca recuperadas.
-  final Set<int> _recentlyLostSeqs = {};
-  static const int _kMaxTrackedLostSeqs = 256;
-  int _totalPacketsRecovered = 0;
-  int _lastNackEpochMs = 0;
+  // ── PING/PONG (medición de RTT desacoplada del audio) ─────────────────────
+  Timer? _pingTimer;
+  int _pingId = 0;
 
   // ── VAD (no transmitir silencio) ──────────────────────────────────────────
   bool _vadWasSilent = false;
@@ -204,26 +176,22 @@ class BluetoothManager {
 
   void Function(int sr, int nc, int bps)? _onWavInfoCallback;
 
-  /// Agrupa el Jitter Buffer en clips discretos para reproducción (ver
-  /// README/AudioPlayerService: se abandonó el streaming en tiempo real por
-  /// un bug nativo confirmado de flutter_sound). El timer es solo la cadencia
-  /// de CHEQUEO — el tamaño del clip lo decide _drainToPlaybackQueue:
-  /// espera a acumular una ráfaga completa (~2 s) antes de emitir, para que
-  /// la pausa de arranque entre clips ocurra solo en el límite natural entre
-  /// ráfagas y no cada medio segundo (probado en campo: clips de 500 ms
-  /// suenan entrecortados porque cada startPlayer() añade ~100-300 ms de
-  /// silencio entre clips).
+  /// Drena el Jitter Buffer hacia el reproductor STREAMING nativo cada
+  /// [kPlaybackBatchTickMs] ms — sin esperar acumulaciones grandes: el
+  /// AudioTrack nativo consume a tiempo real exacto y sin costo por chunk,
+  /// así que aquí solo se vacía todo lo disponible en cada tick.
   Timer? _playbackBatchTimer;
   static const int kPlaybackBatchTickMs = 250;
 
-  /// Tamaño del último tick del Jitter Buffer, para detectar que dejó de
-  /// crecer (fin de la ráfaga en tránsito) y vaciar la cola restante.
-  int _lastJitterSize = 0;
+  /// Acumulador para las métricas de teoría de la información: se calcula
+  /// entropía/capacidad cada ~1 s de audio drenado (muestras suficientes
+  /// para el histograma y sin spamear el log 4 veces por segundo).
+  final BytesBuilder _entropyAccum = BytesBuilder(copy: false);
 
-  // ── Estado de ráfaga entrante en curso ────────────────────────────────────
-  int? _rxBurstId;
-  int? _rxBurstTxEpochMs;
-  int _rxBurstBytesRemaining = 0;
+  // ── Rate-limit del log de FEC (a ~8 paquetes/s el log por paquete
+  //    saturaría la UI): acumula y reporta cada ~2 s. ────────────────────────
+  int _fecLogCounter = 0;
+  int _fecBitsAccum = 0;
 
   // ── Métricas de recepción ──────────────────────────────────────────────────
   int _lastSequenceNumber = -1;
@@ -366,6 +334,7 @@ class BluetoothManager {
             if (event.deviceAddress != null) {
               _startRssiPolling(event.deviceAddress!);
             }
+            _startPingTimer();
             try {
               // La reproducción (ver _beginPlayback) se configura cuando
               // llega el meta-paquete que el otro lado envía al empezar a
@@ -447,6 +416,7 @@ class BluetoothManager {
       _resetRxState();
       _resetTxState();
       _startRssiPolling(address);
+      _startPingTimer();
       // La reproducción arranca cuando llegue el meta-paquete del anfitrión
       // (ver comentario en startAsHost sobre por qué NO se arranca aquí con
       // un formato por defecto).
@@ -505,8 +475,7 @@ class BluetoothManager {
             _statusController.add('Error de micrófono: $e');
           },
         );
-        _statusController.add(
-            'Capturando voz en ráfagas de ${kBurstDurationMs ~/ 1000} s…');
+        _statusController.add('Capturando voz (transmisión continua)…');
       } catch (e, st) {
         _log.w('No se pudo iniciar el micrófono: $e', error: e, stackTrace: st);
         _statusController.add('No se pudo activar el micrófono: $e');
@@ -515,9 +484,9 @@ class BluetoothManager {
       await _pcmSub?.cancel();
       _pcmSub = null;
       // Descartar el residuo parcial acumulado: si quedara, al reactivar el
-      // micrófono la primera ráfaga arrancaría con audio viejo de antes del
+      // micrófono el primer frame arrancaría con audio viejo de antes del
       // silencio (confuso para quien escucha).
-      _burstBuilder.clear();
+      _frameBuilder.clear();
       try {
         await _capture.stopCapture();
       } catch (e) {
@@ -526,8 +495,8 @@ class BluetoothManager {
     }
   }
 
-  /// Acumula PCM del micrófono; al completar una ráfaga de 2 s la encola
-  /// para envío secuencial (la captura continúa mientras se envía).
+  /// Acumula PCM del micrófono; cada FRAME completo (~128 ms) sale al aire
+  /// de inmediato — transmisión continua tipo radio, sin esperar ráfagas.
   ///
   /// Cancelación de eco en dos capas:
   ///  1. Semi-dúplex (garantizado): mientras el parlante PROPIO está
@@ -543,8 +512,8 @@ class BluetoothManager {
       // AEC apagado: full-dúplex sin gating ni NLMS — el eco acústico propio
       // (si no hay auriculares) se escucha tal cual, sin ninguna mitigación.
       _wasGatingMic = false;
-      _burstBuilder.add(chunk);
-      _flushReadyBursts();
+      _frameBuilder.add(chunk);
+      _flushReadyFrames();
       return;
     }
 
@@ -571,47 +540,38 @@ class BluetoothManager {
     }
 
     final Uint8List cleaned = _aec.process(chunk);
-    _burstBuilder.add(cleaned);
-    _flushReadyBursts();
+    _frameBuilder.add(cleaned);
+    _flushReadyFrames();
   }
 
-  /// Extrae y envía cada ráfaga completa acumulada en [_burstBuilder].
-  ///
-  /// BACKPRESSURE (control de saturación): el micrófono produce a ritmo
-  /// fijo (1 ráfaga cada 2 s), pero el canal RFCOMM entrega a un ritmo que
-  /// depende del entorno — y con AMBOS teléfonos transmitiendo a la vez
-  /// (full-dúplex, modo sin optimizar) la demanda combinada puede superar lo
-  /// que el enlace físico realmente da. Sin este límite, la cadena de envío
-  /// acumulaba ráfagas sin tope: cada una salía más tarde que la anterior,
-  /// la latencia SOLO podía crecer, y al final el enlace se ahogaba hasta el
-  /// silencio total (confirmado en campo). Con el límite, si ya hay 2
-  /// ráfagas esperando turno la nueva se DESCARTA: se pierde ese fragmento
-  /// de voz (2 s), pero la conversación se mantiene cerca del presente —
-  /// en tiempo real, fresco-e-incompleto vale más que completo-y-atrasado.
-  static const int _kMaxBurstsInFlight = 2;
-  int _burstsInFlight = 0;
-  int _txBurstsDropped = 0;
+  /// Tope de frames de voz esperando turno en la cadena de envío. Un frame
+  /// son ~128 ms: 8 pendientes ≈ 1 s de atraso máximo posible en el emisor.
+  /// Al superarlo, el frame nuevo se DESCARTA — en tiempo real, fresco e
+  /// incompleto vale más que completo y atrasado. (La versión por ráfagas
+  /// de 2 s permitía hasta ~4 s aquí; con frames el tope es 4× más fino.)
+  static const int _kMaxPacketsInFlight = 8;
+  int _packetsInFlight = 0;
+  int _txFramesDropped = 0;
 
-  void _flushReadyBursts() {
-    while (_burstBuilder.length >= kBurstPcmBytes) {
-      final all = _burstBuilder.takeBytes();
-      final burst = Uint8List.sublistView(all, 0, kBurstPcmBytes);
-      if (all.length > kBurstPcmBytes) {
-        _burstBuilder.add(Uint8List.sublistView(all, kBurstPcmBytes));
+  /// Extrae de [_frameBuilder] cada frame completo (2040 B de PCM) y lo
+  /// envía DE INMEDIATO: VAD → backpressure → μ-law → paquete → aire.
+  void _flushReadyFrames() {
+    while (_frameBuilder.length >= kFramePcmBytes) {
+      final all = _frameBuilder.takeBytes();
+      final frame = Uint8List.sublistView(all, 0, kFramePcmBytes);
+      if (all.length > kFramePcmBytes) {
+        _frameBuilder.add(Uint8List.sublistView(all, kFramePcmBytes));
       }
 
       // ── VAD: el silencio no se transmite ─────────────────────────────
-      // Ahorra el canal para quien SÍ está hablando y, de paso, evita que
-      // el parlante del otro lado reproduzca silencio sin parar (lo que
-      // mantenía su micrófono bloqueado en semi-dúplex — ver kVadRmsThreshold).
-      // Con HANGOVER: tras la última ráfaga con voz se transmite
-      // [kVadHangoverBursts] ráfaga(s) extra, para que el fragmento hablado
-      // termine completo en vez de amputarse cuando la cola de la frase cae
-      // bajo el umbral (reportado en campo como "detecta por fragmentos").
-      final double rms = DspProcessor.rmsEnergy(burst);
+      // Ahorra el canal para quien SÍ está hablando y evita que el parlante
+      // del otro lado reproduzca silencio sin parar (lo que mantenía su
+      // micrófono bloqueado en semi-dúplex). Con hangover de ~0.5 s para no
+      // amputar la cola suave de las frases.
+      final double rms = DspProcessor.rmsEnergy(frame);
       final bool voiced = rms >= kVadRmsThreshold;
       if (voiced) {
-        _vadHangoverRemaining = kVadHangoverBursts;
+        _vadHangoverRemaining = kVadHangoverFrames;
         if (_vadWasSilent) {
           _vadWasSilent = false;
           _algorithmLogController
@@ -624,106 +584,55 @@ class BluetoothManager {
         if (!_vadWasSilent) {
           _vadWasSilent = true;
           _algorithmLogController.add(
-              'VAD: silencio — se deja de transmitir hasta detectar voz '
-              '(RMS ${rms.toStringAsFixed(4)})');
+              'VAD: silencio — se deja de transmitir hasta detectar voz');
         }
         continue;
       }
 
-      if (_burstsInFlight >= _kMaxBurstsInFlight) {
-        _txBurstsDropped++;
-        _recentLinkStress += 4.0; // saturación propia también es estrés
-        _log.w('TX saturado: ráfaga descartada '
-            '($_txBurstsDropped descartadas en total)');
-        // Solo la 1ª y luego cada 5ª: bajo saturación sostenida este evento
-        // se dispara seguido y el spam de log (con su notifyListeners por
-        // línea) le quitaría CPU justo al teléfono que ya va ahogado.
-        if (_txBurstsDropped == 1 || _txBurstsDropped % 5 == 0) {
+      // ── Backpressure por frame: jamás acumular atraso en el emisor ───
+      if (_packetsInFlight >= _kMaxPacketsInFlight) {
+        _txFramesDropped++;
+        _recentLinkStress += 1.0; // saturación propia también es estrés
+        if (_txFramesDropped == 1 || _txFramesDropped % 20 == 0) {
           _algorithmLogController.add(
-              'Backpressure: canal saturado → ráfaga descartada en el emisor '
-              '($_txBurstsDropped en total; no se acumula atraso)');
+              'Backpressure: canal saturado → frame descartado en el emisor '
+              '($_txFramesDropped en total; no se acumula atraso)');
         }
         continue;
       }
 
-      final id = _txBurstId;
-      _txBurstId = (_txBurstId + 1) & 0xFFFF;
-      _burstsInFlight++;
-      _sendChain = _sendChain
-          .then((_) => _sendBurst(id, burst))
-          .catchError((Object e) {
-        _log.w('Error enviando ráfaga #$id: $e');
+      // μ-law: 2040 B de PCM → exactamente un payload de 1020 B al aire.
+      final Uint8List wire = MuLawCodec.encode(frame);
+      final packet = buildPacket(_txSeq & 0xFFFF, wire);
+      _txSeq++;
+      _packetsInFlight++;
+      _sendChain =
+          _sendChain.then((_) => _txWrite(packet)).catchError((Object e) {
+        _log.w('Error enviando frame de voz: $e');
       }).whenComplete(() {
-        if (_burstsInFlight > 0) _burstsInFlight--;
+        if (_packetsInFlight > 0) _packetsInFlight--;
       });
     }
   }
 
-  /// Envía una ráfaga completa: cabecera con timestamp + paquetes de datos.
-  ///
-  /// El PCM lineal se comprime a μ-law ANTES de salir al aire (adaptación
-  /// de la tasa de la fuente a la capacidad del canal — ver companding.dart):
-  /// una ráfaga de 2 s pasa de 32000 B a 16000 B (16 paquetes).
-  Future<void> _sendBurst(int burstId, Uint8List pcm) async {
-    final Uint8List wire = MuLawCodec.encode(pcm);
+  // ──────────────────────────────────────────────────────────────────────────
+  // PING PERIÓDICO (RTT — ver PING/PONG en app_models.dart)
+  // ──────────────────────────────────────────────────────────────────────────
 
-    final int txEpochMs = DateTime.now().millisecondsSinceEpoch;
-    await _txWrite(buildBurstHeaderPacket(
-      burstId: burstId,
-      pcmByteLength: wire.length,
-      txEpochMs: txEpochMs,
-    ));
-
-    // ARQ: se cachea la ráfaga YA CODIFICADA (bytes de aire + SEQ inicial)
-    // por si el receptor pide reenvío — el emisor solo guarda la ÚLTIMA,
-    // es best-effort (si ya empezó la siguiente, la solicitud llega tarde).
-    _lastSentBurstId = burstId;
-    _lastSentBurstPcm = wire;
-    _lastSentBurstStartSeq = _txSeq;
-
-    int offset = 0;
-    int packets = 0;
-    while (offset < wire.length) {
-      final int end = (offset + kPayloadSize).clamp(0, wire.length);
-      Uint8List payload = Uint8List.sublistView(wire, offset, end);
-      if (payload.length < kPayloadSize) {
-        // Relleno con SILENCIO μ-law (0xFF), no con ceros binarios: 0x00 en
-        // μ-law decodifica a casi fondo de escala y sonaría como un clic.
-        payload = Uint8List(kPayloadSize)
-          ..fillRange(0, kPayloadSize, MuLawCodec.kSilenceByte)
-          ..setRange(0, end - offset, payload);
-      }
-      await _txWrite(buildPacket(_txSeq & 0xFFFF, payload));
-      _txSeq++;
-      offset += kPayloadSize;
-      packets++;
-    }
-
-    final int sendMs = DateTime.now().millisecondsSinceEpoch - txEpochMs;
-    _log.i(
-        'TX ráfaga #$burstId: ${wire.length} B μ-law en $packets paquetes ($sendMs ms)');
-  }
-
-  /// ARQ: reenvía todos los paquetes de datos de una ráfaga previamente
-  /// cacheada (sin repetir su cabecera — el receptor ya la tiene), usando
-  /// los MISMOS números de secuencia originales para que el receptor pueda
-  /// reconciliarlos con los que marcó como perdidos.
-  Future<void> _resendBurstPackets(int burstId, Uint8List wire, int startSeq) async {
-    int seq = startSeq;
-    int offset = 0;
-    while (offset < wire.length) {
-      final int end = (offset + kPayloadSize).clamp(0, wire.length);
-      Uint8List payload = Uint8List.sublistView(wire, offset, end);
-      if (payload.length < kPayloadSize) {
-        payload = Uint8List(kPayloadSize)
-          ..fillRange(0, kPayloadSize, MuLawCodec.kSilenceByte)
-          ..setRange(0, end - offset, payload);
-      }
-      await _txWrite(buildPacket(seq & 0xFFFF, payload));
-      seq++;
-      offset += kPayloadSize;
-    }
-    _log.i('ARQ: reenviada ráfaga #$burstId completa a pedido del receptor');
+  void _startPingTimer() {
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(
+      const Duration(milliseconds: kPingIntervalMs),
+      (_) {
+        _pingId = (_pingId + 1) & 0xFFFF;
+        unawaited(_txWrite(buildPingPacket(
+          pingId: _pingId,
+          epochMs: DateTime.now().millisecondsSinceEpoch,
+        )).catchError((Object e) {
+          _log.w('No se pudo enviar PING: $e');
+        }));
+      },
+    );
   }
 
   /// Escritura unificada de TX: servidor nativo (anfitrión) o socket cliente.
@@ -841,8 +750,9 @@ class BluetoothManager {
   /// Determina el tamaño esperado de paquete según sus magic bytes: el ACK
   /// es más corto (20 B) que el resto de tipos (kPacketSize, 1024 B).
   int _expectedPacketLength(int b0, int b1) {
-    if (b0 == kAckMagic0 && b1 == kAckMagic1) return kAckPacketSize;
-    if (b0 == kNackMagic0 && b1 == kNackMagic1) return kNackPacketSize;
+    if (b0 == kPingMagic0 && (b1 == kPingMagic1 || b1 == kPongMagic1)) {
+      return kPingPacketSize;
+    }
     return kPacketSize;
   }
 
@@ -884,9 +794,8 @@ class BluetoothManager {
       final b1 = _receiveBuffer[i + 1];
       if ((b0 == kMagicByte0 && b1 == kMagicByte1) || // paquete de datos
           (b0 == 0xCC && b1 == 0xDD) || // meta-paquete audio
-          (b0 == kBurstMagic0 && b1 == kBurstMagic1) || // cabecera de ráfaga
-          (b0 == kAckMagic0 && b1 == kAckMagic1) || // ACK de ráfaga
-          (b0 == kNackMagic0 && b1 == kNackMagic1) || // NACK (solicitud ARQ)
+          (b0 == kPingMagic0 &&
+              (b1 == kPingMagic1 || b1 == kPongMagic1)) || // PING/PONG
           (b0 == 0xFF && b1 == 0xFF)) {
         // fin de stream
         return i;
@@ -913,64 +822,27 @@ class BluetoothManager {
       return;
     }
 
-    // ── ACK de ráfaga propia (RTT medido con el reloj local) ────────────
-    if (b0 == kAckMagic0 && b1 == kAckMagic1) {
-      final ack = BurstAck.parse(packet);
+    // ── PING entrante → responder PONG con el MISMO timestamp ───────────
+    if (b0 == kPingMagic0 && b1 == kPingMagic1) {
+      final ping = PingPong.parse(packet);
+      unawaited(_txWrite(
+              buildPongPacket(pingId: ping.pingId, epochMs: ping.epochMs))
+          .catchError((Object e) {
+        _log.w('No se pudo responder PONG: $e');
+      }));
+      return;
+    }
+
+    // ── PONG: RTT medido enteramente con nuestro propio reloj ────────────
+    if (b0 == kPingMagic0 && b1 == kPongMagic1) {
+      final pong = PingPong.parse(packet);
       final double rttMs =
-          (DateTime.now().millisecondsSinceEpoch - ack.txEpochMs).toDouble();
-      _log.i('ACK ráfaga #${ack.burstId}: latencia de bloque (RTT) '
-          '${rttMs.toStringAsFixed(0)} ms');
+          (DateTime.now().millisecondsSinceEpoch - pong.epochMs).toDouble();
       _latencyController.add(LatencyMetric(
-        burstId: ack.burstId,
+        pingId: pong.pingId,
         latencyMs: rttMs,
-        isRoundTrip: true,
         timestamp: DateTime.now(),
       ));
-      return;
-    }
-
-    // ── Cabecera de ráfaga entrante ──────────────────────────────────────
-    if (b0 == kBurstMagic0 && b1 == kBurstMagic1) {
-      final header = BurstHeader.parse(packet);
-      _rxBurstId = header.burstId;
-      _rxBurstTxEpochMs = header.txEpochMs;
-      _rxBurstBytesRemaining = header.pcmByteLength;
-      _log.i('RX cabecera ráfaga #${header.burstId}: '
-          '${header.pcmByteLength} B esperados');
-      return;
-    }
-
-    // ── NACK: el otro lado pide reenvío de una ráfaga que él transmitió ──
-    if (b0 == kNackMagic0 && b1 == kNackMagic1) {
-      final req = NackRequest.parse(packet);
-      if (_lastSentBurstId == req.burstId &&
-          _lastSentBurstPcm != null &&
-          _lastSentBurstStartSeq != null) {
-        // El reenvío también respeta el backpressure: retransmitir sobre un
-        // canal ya saturado solo profundiza la congestión que causó la
-        // pérdida original — mejor dejar que el PLC del receptor cubra ese
-        // hueco y conservar el canal para el audio fresco.
-        if (_burstsInFlight >= _kMaxBurstsInFlight) {
-          _algorithmLogController.add(
-              'ARQ: reenvío de ráfaga #${req.burstId} IGNORADO — canal '
-              'saturado (retransmitir empeoraría la congestión)');
-          return;
-        }
-        _algorithmLogController.add(
-            'ARQ: solicitud de reenvío para ráfaga #${req.burstId} → reenviando');
-        final pcm = _lastSentBurstPcm!;
-        final startSeq = _lastSentBurstStartSeq!;
-        _burstsInFlight++;
-        _sendChain = _sendChain
-            .then((_) => _resendBurstPackets(req.burstId, pcm, startSeq))
-            .catchError((Object e) {
-          _log.w('ARQ: error reenviando ráfaga #${req.burstId}: $e');
-        }).whenComplete(() {
-          if (_burstsInFlight > 0) _burstsInFlight--;
-        });
-      } else {
-        _log.d('ARQ: ráfaga #${req.burstId} ya no está en caché, se ignora');
-      }
       return;
     }
 
@@ -991,46 +863,6 @@ class BluetoothManager {
     final int seqNum = parseSequenceNumber(packet);
     if (seqNum == -1) return;
 
-    // ── ARQ: ¿es la retransmisión tardía de un paquete ya marcado perdido? ──
-    // Un SEQ "atrasado" respecto al último aceptado, dentro de la ventana de
-    // recuperación, no es un paquete nuevo — es la respuesta a un NACK. El
-    // payload recuperado se encola al final del Jitter Buffer (sale con el
-    // siguiente clip, junto al resto del audio): reproducirlo como clip
-    // aparte producía un "clic" de 32 ms con ~200 ms de arranque, y además
-    // competía por los 4 cupos de la cola de reproducción con los clips
-    // reales. RFCOMM es un transporte ordenado, así que el ÚNICO origen
-    // posible de un SEQ atrasado son nuestras propias retransmisiones.
-    if (_lastSequenceNumber != -1) {
-      final int backDistance = (_lastSequenceNumber - seqNum) & 0xFFFF;
-      if (backDistance > 0 && backDistance <= kArqRecoveryWindowPackets) {
-        if (_recentlyLostSeqs.remove(seqNum)) {
-          _totalPacketsRecovered++;
-          _totalPacketsLost = (_totalPacketsLost - 1).clamp(0, 1 << 30);
-          final recoveredWire = Uint8List.sublistView(packet, 4, kPacketSize);
-          _dsp.processBlock(
-            rawBlock:
-                _rxIsMuLaw ? MuLawCodec.decode(recoveredWire) : recoveredWire,
-            rssiDbm: _effectiveRssi,
-            isLost: false,
-            plcEnabled: signalSettings.plcEnabled,
-            filterEnabled: signalSettings.filterEnabled,
-            fecEnabled: signalSettings.fecEnabled,
-            numChannels: _rxNumChannels,
-            bitsPerSample: _rxBitsPerSample,
-            lostBlockSize: _rxBlockSizeDecoded,
-          );
-          _algorithmLogController.add(
-              'ARQ: paquete SEQ=$seqNum recuperado por retransmisión '
-              '(añadido al final del buffer)');
-          _metricsController.add(currentMetrics);
-        } else {
-          _log.d('Paquete SEQ=$seqNum ignorado (duplicado o fuera de '
-              'ventana ARQ)');
-        }
-        return;
-      }
-    }
-
     // ── Detección de paquetes perdidos por saltos en secuencia ───────────
     int lostInGap = 0;
     if (_lastSequenceNumber != -1) {
@@ -1050,29 +882,6 @@ class BluetoothManager {
             : 'Pérdida: $lostInGap paquete(s) — PLC apagado, queda un hueco '
                 'de silencio');
 
-        if (signalSettings.arqEnabled && _rxBurstId != null) {
-          for (int i = 0; i < lostInGap; i++) {
-            _recentlyLostSeqs.add((expected + i) & 0xFFFF);
-          }
-          while (_recentlyLostSeqs.length > _kMaxTrackedLostSeqs) {
-            _recentlyLostSeqs.remove(_recentlyLostSeqs.first);
-          }
-          // Disciplina anti-congestión: como mucho un NACK cada
-          // kMinNackIntervalMs — pedir reenvío por CADA hueco en un canal
-          // ya estresado realimenta la congestión (reenvíos → más carga →
-          // más huecos → más reenvíos) en vez de corregirla.
-          final int nowMs = DateTime.now().millisecondsSinceEpoch;
-          if (nowMs - _lastNackEpochMs >= kMinNackIntervalMs) {
-            _lastNackEpochMs = nowMs;
-            _algorithmLogController
-                .add('ARQ: solicitando reenvío de la ráfaga #$_rxBurstId');
-            unawaited(_txWrite(buildNackPacket(burstId: _rxBurstId!))
-                .catchError((Object e) {
-              _log.w('No se pudo enviar NACK: $e');
-            }));
-          }
-        }
-
         for (int i = 0; i < lostInGap; i++) {
           _dsp.processBlock(
             rawBlock: null,
@@ -1085,7 +894,6 @@ class BluetoothManager {
             bitsPerSample: _rxBitsPerSample,
             lostBlockSize: _rxBlockSizeDecoded,
           );
-          _consumeBurstBytes(kPayloadSize);
         }
       }
     }
@@ -1108,12 +916,18 @@ class BluetoothManager {
       bitsPerSample: _rxBitsPerSample,
       lostBlockSize: _rxBlockSizeDecoded,
     );
-    if (_dsp.lastFecCorrectedBits > 0) {
-      _algorithmLogController.add(
-          'FEC (Hamming 7,4): ${_dsp.lastFecCorrectedBits} bit(s) '
-          'corregidos automáticamente');
+    // FEC con log de cadencia acotada (a ~8 paquetes/s el log por paquete
+    // saturaría la UI de notificaciones).
+    _fecBitsAccum += _dsp.lastFecCorrectedBits;
+    if (++_fecLogCounter >= 16) {
+      if (_fecBitsAccum > 0) {
+        _algorithmLogController.add(
+            'FEC (Hamming 7,4): $_fecBitsAccum bit(s) corregidos en los '
+            'últimos ~2 s');
+      }
+      _fecLogCounter = 0;
+      _fecBitsAccum = 0;
     }
-    _consumeBurstBytes(kPayloadSize);
 
     // ── Emitir métricas actualizadas ─────────────────────────────────────
     final total = _totalPacketsReceived + _totalPacketsLost;
@@ -1127,53 +941,16 @@ class BluetoothManager {
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
       packetsLost: _totalPacketsLost,
-      packetsRecovered: _totalPacketsRecovered,
       timestamp: DateTime.now(),
     ));
-  }
-
-  /// Descuenta bytes de la ráfaga en curso; al completarla estima el tiempo
-  /// de tránsito, emite la métrica y responde ACK (fire-and-forget: no debe
-  /// bloquear el pipeline de recepción si la escritura tarda).
-  void _consumeBurstBytes(int bytes) {
-    if (_rxBurstId == null) return;
-    _rxBurstBytesRemaining -= bytes;
-    if (_rxBurstBytesRemaining > 0) return;
-
-    final int rxEpochMs = DateTime.now().millisecondsSinceEpoch;
-    final double transitMs = (rxEpochMs - _rxBurstTxEpochMs!).toDouble();
-    _log.i('RX ráfaga #$_rxBurstId completa: tránsito '
-        '${transitMs.toStringAsFixed(0)} ms (relojes no sincronizados)');
-
-    _latencyController.add(LatencyMetric(
-      burstId: _rxBurstId!,
-      latencyMs: transitMs,
-      isRoundTrip: false,
-      timestamp: DateTime.now(),
-    ));
-
-    unawaited(_txWrite(buildAckPacket(
-      burstId: _rxBurstId!,
-      txEpochMs: _rxBurstTxEpochMs!,
-      rxEpochMs: rxEpochMs,
-    )).catchError((Object e) {
-      _log.w('No se pudo enviar ACK de ráfaga #$_rxBurstId: $e');
-    }));
-
-    _rxBurstId = null;
-    _rxBurstTxEpochMs = null;
-    _rxBurstBytesRemaining = 0;
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // REPRODUCCIÓN — AGRUPAR EL JITTER BUFFER EN CLIPS DISCRETOS
+  // REPRODUCCIÓN — DRENAJE CONTINUO HACIA EL REPRODUCTOR STREAMING NATIVO
   // ──────────────────────────────────────────────────────────────────────────
 
   /// Fija el formato de audio entrante y asegura que el temporizador de
-  /// agrupado esté corriendo. Operación puramente local y síncrona — no hay
-  /// ningún estado de reproductor nativo persistente que reiniciar, así que
-  /// no existe el riesgo de arranques concurrentes que teníamos con el
-  /// streaming en tiempo real (ver AudioPlayerService).
+  /// drenaje esté corriendo.
   void _beginPlayback(int sampleRate, int numChannels, int bitsPerSample) {
     _rxSampleRate = sampleRate;
     _rxNumChannels = numChannels;
@@ -1182,59 +959,44 @@ class BluetoothManager {
     _startPlaybackBatching();
   }
 
-  /// Arranca (si no estaba corriendo) el timer de chequeo del agrupado.
+  /// Arranca (si no estaba corriendo) el timer de drenaje.
   void _startPlaybackBatching() {
     if (_playbackBatchTimer != null) return;
-    _lastJitterSize = 0;
     _playbackBatchTimer = Timer.periodic(
       const Duration(milliseconds: kPlaybackBatchTickMs),
       (_) => _drainToPlaybackQueue(),
     );
   }
 
-  /// Bloques que debe acumular el Jitter Buffer antes de emitir un clip:
-  /// una ráfaga completa de audio DECODIFICADO. Con μ-law cada bloque de
-  /// 1020 B de aire se expande a 2040 B de PCM, así que 2 s de voz a 8 kHz
-  /// (32000 B) son ~15 bloques; en modo .wav (PCM lineal) el bloque queda
-  /// de 1020 B. Depende del códec anunciado, por eso no puede ser estático.
-  int get _minClipBlocks => kBurstPcmBytes ~/ _rxBlockSizeDecoded;
-
-  /// Emite un clip solo cuando hay una ráfaga completa acumulada, O cuando
-  /// el buffer dejó de crecer entre ticks (llegó el final de la transmisión
-  /// o una ráfaga incompleta por pérdidas) — así el clip típico dura ~2 s y
-  /// la pausa de arranque entre clips cae en el límite natural entre
-  /// ráfagas, en vez de trocear la voz cada 500 ms.
+  /// Vacía TODO lo disponible del Jitter Buffer hacia el reproductor
+  /// streaming en cada tick — sin esperar acumulaciones: el AudioTrack
+  /// nativo consume a tiempo real exacto y no cobra costo por chunk (a
+  /// diferencia de la reproducción por clips que obligaba a agrupar 2 s).
   void _drainToPlaybackQueue() {
-    final int size = _dsp.jitterBuffer.size;
-    if (size == 0) {
-      _lastJitterSize = 0;
-      return;
-    }
-    final bool fullClip = size >= _minClipBlocks;
-    final bool stalled = size == _lastJitterSize;
-    _lastJitterSize = size;
-    if (!fullClip && !stalled) return; // seguir acumulando
-
+    if (_dsp.jitterBuffer.isEmpty) return;
     final builder = BytesBuilder(copy: false);
     Uint8List? block;
     while ((block = _dsp.jitterBuffer.pop()) != null) {
       builder.add(block!);
     }
-    _lastJitterSize = 0;
     if (builder.isEmpty) return;
-    final clip = builder.toBytes();
-    _audioChunkController.add(clip);
-    _aec.pushReference(clip); // referencia far-end para el cancelador de eco
+    final chunk = builder.toBytes();
+    _audioChunkController.add(chunk);
+    _aec.pushReference(chunk); // referencia far-end para el cancelador de eco
 
-    // Teoría de la Información (Cap. IV): capacidad de Shannon del canal
-    // (con el RSSI efectivo como proxy de SNR — si el canal degradado está
-    // forzado para la demo, la capacidad reportada baja coherentemente) y
-    // entropía de la fuente medida sobre el clip que se acaba de completar.
+    // Teoría de la Información (Cap. IV) con cadencia acotada: acumula ~1 s
+    // de audio y recién entonces calcula/emite — entropía sobre muestras
+    // suficientes para el histograma, y sin spamear el log 4 veces/segundo.
+    _entropyAccum.add(chunk);
+    if (_entropyAccum.length < 16000) return;
+    final sample = _entropyAccum.takeBytes();
+
     final double capacityBps = InformationTheory.shannonCapacityBps(
       rssiDbm: _effectiveRssi,
       sampleRate: _rxSampleRate,
     );
-    final double entropy = InformationTheory.sourceEntropyBitsPerSample(clip);
+    final double entropy =
+        InformationTheory.sourceEntropyBitsPerSample(sample);
     final double maxEntropy = InformationTheory.maxEntropyBitsPerSample();
     _infoTheoryController.add(InfoTheoryMetrics(
       channelCapacityBps: capacityBps,
@@ -1253,7 +1015,7 @@ class BluetoothManager {
             : ' · canal degradado$forcedTag: AWGN inyectado SIN filtrar — filtro '
                 'apagado (RSSI efectivo ${_effectiveRssi.toStringAsFixed(0)} dBm)';
     _algorithmLogController.add(
-      'Clip reproducido (${(clip.length / 1024).toStringAsFixed(1)} KB): '
+      'Audio reproducido (${(sample.length / 1024).toStringAsFixed(1)} KB): '
       'H(X)=${entropy.toStringAsFixed(2)}/${maxEntropy.toStringAsFixed(0)} bits/muestra, '
       'C≈${(capacityBps / 1000).toStringAsFixed(1)} kbps$degradedNote',
     );
@@ -1316,33 +1078,27 @@ class BluetoothManager {
     _lastSequenceNumber = -1;
     _totalPacketsReceived = 0;
     _totalPacketsLost = 0;
-    _totalPacketsRecovered = 0;
-    _recentlyLostSeqs.clear();
     _rxIsMuLaw = false;
-    _lastNackEpochMs = 0;
     _recentLinkStress = 0.0;
-    _rxBurstId = null;
-    _rxBurstTxEpochMs = null;
-    _rxBurstBytesRemaining = 0;
+    _entropyAccum.clear();
+    _fecLogCounter = 0;
+    _fecBitsAccum = 0;
     _dsp.reset();
   }
 
   void _resetTxState() {
-    _txBurstId = 0;
     _txSeq = 0;
-    _burstBuilder.clear();
+    _pingId = 0;
+    _frameBuilder.clear();
     _sendChain = Future.value();
-    _burstsInFlight = 0;
-    _txBurstsDropped = 0;
+    _packetsInFlight = 0;
+    _txFramesDropped = 0;
     _vadWasSilent = false;
     _vadSkippedBursts = 0;
     _vadHangoverRemaining = 0;
     _speakerActiveLastMs = 0;
     _aec.reset();
     _wasGatingMic = false;
-    _lastSentBurstPcm = null;
-    _lastSentBurstId = null;
-    _lastSentBurstStartSeq = null;
   }
 
   /// Detiene la transmisión/recepción y cierra la conexión.
@@ -1350,9 +1106,10 @@ class BluetoothManager {
     _serverTxActive = false;
     _rssiTimer?.cancel();
     _rssiTimer = null;
+    _pingTimer?.cancel();
+    _pingTimer = null;
     _playbackBatchTimer?.cancel();
     _playbackBatchTimer = null;
-    _lastJitterSize = 0;
     _resetRxState();
     _resetTxState();
 
@@ -1402,7 +1159,6 @@ class BluetoothManager {
       bufferFillRatio: _dsp.jitterBuffer.fillRatio,
       packetsReceived: _totalPacketsReceived,
       packetsLost: _totalPacketsLost,
-      packetsRecovered: _totalPacketsRecovered,
       timestamp: DateTime.now(),
     );
   }

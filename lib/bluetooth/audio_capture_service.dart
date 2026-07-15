@@ -2,7 +2,7 @@
 //
 // Captura de micrófono en PCM lineal Int16 LE (sin compresión) usando
 // flutter_sound. Emite los bytes crudos por un Stream; la segmentación en
-// ráfagas de 2 s la hace BluetoothManager acumulando kBurstPcmBytes.
+// frames de ~128 ms la hace BluetoothManager acumulando kFramePcmBytes.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';

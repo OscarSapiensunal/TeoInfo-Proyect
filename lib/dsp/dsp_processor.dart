@@ -24,7 +24,7 @@ import 'error_correction.dart';
 /// Capacidad del Jitter Buffer en número de bloques de audio.
 ///
 /// DEBE ser al menos tantos bloques como una ráfaga completa de voz
-/// (kBurstPcmBytes / kPayloadSize ≈ 63 bloques para 2 s a 16 kHz mono).
+/// (con frames de voz continuos de ~128 ms, 80 bloques ≈ 10 s de margen).
 /// Bluetooth entrega los 63 paquetes de una ráfaga casi de golpe (no
 /// espaciados en el tiempo); con una capacidad menor (16, el valor
 /// original), el buffer se llena y descarta con política drop-oldest la

@@ -25,6 +25,10 @@ import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -36,8 +40,10 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.OutputStream
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : FlutterActivity() {
@@ -46,6 +52,7 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "DspBtAnalyzer"
         private const val RSSI_CHANNEL = "com.dsp_bt_analyzer/rssi"
         private const val SYSTEM_CHANNEL = "com.dsp_bt_analyzer/system"
+        private const val PLAYER_CHANNEL = "com.dsp_bt_analyzer/player"
         private const val SERVER_CHANNEL = "com.dsp_bt_analyzer/spp_server"
         private const val SERVER_EVENTS_CHANNEL = "com.dsp_bt_analyzer/spp_server_events"
         private const val SPP_SERVICE_NAME = "DSP_BT_ANALYZER"
@@ -57,6 +64,81 @@ class MainActivity : FlutterActivity() {
     private val latestRssi = AtomicInteger(-60)
     private var gattForRssi: BluetoothGatt? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // ── Reproductor de audio streaming (AudioTrack propio) ────────────────
+    //
+    // Reemplaza la reproducción por clips discretos de flutter_sound: su API
+    // de streaming crashea nativamente (issue #508) y la de clips añade
+    // ~0.2 s de arranque POR CLIP, haciendo el consumo estructuralmente más
+    // lento que el tiempo real (la latencia solo podía crecer). Aquí:
+    //   · UN solo hilo escritor (AudioTrack.write serializado por diseño —
+    //     el crash de flutter_sound era concurrencia en esta misma API).
+    //   · AudioTrack en MODE_STREAM consume a tiempo real exacto.
+    //   · Cola acotada con drop-oldest: si Dart llegara a empujar más rápido
+    //     de lo que se reproduce, se pierde lo más viejo, jamás se acumula.
+    private var playerTrack: AudioTrack? = null
+    private var playerThread: Thread? = null
+    private val playerQueue = ArrayBlockingQueue<ByteArray>(32)
+    @Volatile private var playerRunning = false
+    private var playerSampleRate = 0
+    private var playerChannels = 0
+
+    private fun startPlayerTrack(sampleRate: Int, channels: Int) {
+        if (playerRunning && sampleRate == playerSampleRate && channels == playerChannels) return
+        stopPlayerTrack()
+
+        val chMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO
+                     else AudioFormat.CHANNEL_OUT_MONO
+        val minBuf = AudioTrack.getMinBufferSize(
+            sampleRate, chMask, AudioFormat.ENCODING_PCM_16BIT)
+        val track = AudioTrack(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build(),
+            AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setChannelMask(chMask)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .build(),
+            maxOf(minBuf * 4, 8192),
+            AudioTrack.MODE_STREAM,
+            AudioManager.AUDIO_SESSION_ID_GENERATE
+        )
+        track.play()
+        playerTrack = track
+        playerSampleRate = sampleRate
+        playerChannels = channels
+        playerRunning = true
+        playerThread = Thread {
+            while (playerRunning) {
+                val chunk = try {
+                    playerQueue.poll(200, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) { null } ?: continue
+                try {
+                    playerTrack?.write(chunk, 0, chunk.size)
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioTrack.write falló: ${e.message}")
+                }
+            }
+        }.also { it.name = "pt-writer"; it.start() }
+        Log.i(TAG, "AudioTrack streaming iniciado: ${sampleRate}Hz ${channels}ch")
+    }
+
+    private fun stopPlayerTrack() {
+        playerRunning = false
+        // Unirse al hilo escritor ANTES de liberar el track: garantiza que
+        // ningún write() concurra con release() (la receta del SIGSEGV).
+        try { playerThread?.join(600) } catch (_: InterruptedException) {}
+        playerThread = null
+        playerQueue.clear()
+        try {
+            playerTrack?.pause()
+            playerTrack?.flush()
+            playerTrack?.release()
+        } catch (_: Exception) {}
+        playerTrack = null
+    }
 
     // ── Estado del servidor SPP ───────────────────────────────────────────
     private var serverSocket: BluetoothServerSocket? = null
@@ -137,6 +219,44 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
                 "isConnected" -> result.success(clientSocket?.isConnected == true)
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            PLAYER_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "ptStart" -> {
+                    val sr = call.argument<Int>("sampleRate") ?: 8000
+                    val ch = call.argument<Int>("channels") ?: 1
+                    try {
+                        startPlayerTrack(sr, ch)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("PT_START", e.message, null)
+                    }
+                }
+                "ptWrite" -> {
+                    val bytes = call.argument<ByteArray>("bytes")
+                    if (bytes == null || !playerRunning) {
+                        result.success(null)
+                        return@setMethodCallHandler
+                    }
+                    // Cola llena → drop-oldest: preferimos perder el audio
+                    // más viejo a acumular atraso (la conversación se queda
+                    // cerca del presente).
+                    if (!playerQueue.offer(bytes)) {
+                        playerQueue.poll()
+                        playerQueue.offer(bytes)
+                    }
+                    result.success(null)
+                }
+                "ptStop" -> {
+                    stopPlayerTrack()
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -399,6 +519,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         stopSppServer()
+        stopPlayerTrack()
         writeExecutor.shutdown()
         stopRssiPolling()
         super.onDestroy()

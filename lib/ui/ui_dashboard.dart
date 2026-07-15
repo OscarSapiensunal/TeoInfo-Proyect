@@ -210,7 +210,7 @@ class _MicToggleCard extends StatelessWidget {
           Expanded(
             child: Text(
               state.micEnabled
-                  ? 'Activo: hablas en ráfagas de ${kBurstDurationMs ~/ 1000} s.'
+                  ? 'Activo: transmisión continua (solo viaja cuando hablas — VAD).'
                   : 'Silenciado: solo escuchas.',
               style: const TextStyle(color: _C.textMuted, fontSize: 12),
             ),
@@ -513,7 +513,7 @@ class _SignalOptimizationCard extends StatelessWidget {
     final s = state.signalSettings;
     final String subtitle;
     if (s.allEnabled) {
-      subtitle = 'Optimizada (con las 5 mejoras activas)';
+      subtitle = 'Optimizada (con las 4 mejoras activas)';
     } else if (s.allDisabled) {
       subtitle = 'Sin optimizar (la señal tal cual llega, sin mejoras)';
     } else {
@@ -522,9 +522,8 @@ class _SignalOptimizationCard extends StatelessWidget {
         s.filterEnabled,
         s.aecEnabled,
         s.fecEnabled,
-        s.arqEnabled,
       ].where((v) => v).length;
-      subtitle = 'Personalizado ($active de 5 mejoras activas)';
+      subtitle = 'Personalizado ($active de 4 mejoras activas)';
     }
 
     return _Card(
@@ -548,13 +547,6 @@ class _SignalOptimizationCard extends StatelessWidget {
               ),
             ],
           ),
-          if (state.metrics.packetsRecovered > 0) ...[
-            const SizedBox(height: 4),
-            Text(
-              'ARQ recuperó ${state.metrics.packetsRecovered} paquete(s) por retransmisión',
-              style: const TextStyle(color: _C.accentGreen, fontSize: 11),
-            ),
-          ],
           // Sin degradación no hay nada que corregir: avisar para que el
           // switch no parezca "muerto" cuando el canal simplemente está sano.
           if (!state.forceDegradedChannel &&
@@ -622,11 +614,6 @@ class _SignalOptimizationCard extends StatelessWidget {
                   label: 'FEC (Hamming 7,4) — corrige bits corruptos',
                   value: s.fecEnabled,
                   onChanged: (v) => state.setIndividualOptimization(fec: v),
-                ),
-                _OptimizationSwitchRow(
-                  label: 'ARQ — pide reenvío de ráfagas con huecos',
-                  value: s.arqEnabled,
-                  onChanged: (v) => state.setIndividualOptimization(arq: v),
                 ),
               ],
             ),
@@ -716,7 +703,7 @@ class _LatencyCard extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               _MetricTile(
-                label: 'RÁFAGAS',
+                label: 'PINGS',
                 value: '${state.burstCount}',
                 icon: Icons.stacked_bar_chart_rounded,
                 color: _C.accentGreen,

@@ -26,7 +26,7 @@ import 'package:logger/logger.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../bluetooth/bluetooth_manager.dart';
-import '../bluetooth/audio_player_service.dart';
+import '../bluetooth/native_audio_player.dart';
 import '../bluetooth/system_channel.dart';
 import '../models/app_models.dart';
 
@@ -34,7 +34,7 @@ class AppState extends ChangeNotifier {
   final Logger _log = Logger();
 
   final BluetoothManager btManager = BluetoothManager();
-  final AudioPlayerService audioPlayer = AudioPlayerService();
+  final NativeAudioPlayer audioPlayer = NativeAudioPlayer();
 
   /// Si está habilitado, este dispositivo captura y transmite su propio
   /// micrófono. Se puede cambiar antes de conectar o EN VIVO durante una
@@ -116,14 +116,12 @@ class AppState extends ChangeNotifier {
     bool? filter,
     bool? aec,
     bool? fec,
-    bool? arq,
   }) {
     _signalSettings = _signalSettings.copyWith(
       plcEnabled: plc,
       filterEnabled: filter,
       aecEnabled: aec,
       fecEnabled: fec,
-      arqEnabled: arq,
     );
     btManager.signalSettings = _signalSettings;
     notifyListeners();
@@ -429,10 +427,9 @@ class AppState extends ChangeNotifier {
     await audioPlayer.init();
   }
 
-  /// Solo fija el formato — ya no arranca ningún reproductor persistente
-  /// (ver AudioPlayerService: se reproduce por clips discretos encolados,
-  /// no streaming en tiempo real), así que no hay nada que pueda fallar
-  /// aquí ni ningún estado que reiniciar.
+  /// Solo fija el formato del reproductor streaming nativo (ver
+  /// NativeAudioPlayer) — el AudioTrack se (re)crea perezosamente con el
+  /// primer chunk que llegue con este formato.
   void _onWavInfo(int sampleRate, int numChannels, int bitsPerSample) {
     audioPlayer.configure(sampleRate: sampleRate, numChannels: numChannels);
     _log.i('Formato de audio: ${sampleRate}Hz ${numChannels}ch');
@@ -453,7 +450,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     _audioChunkSub = btManager.audioChunkStream.listen((chunk) {
-      audioPlayer.enqueueChunk(chunk);
+      unawaited(audioPlayer.enqueueChunk(chunk));
     });
     _statusSub = btManager.statusStream.listen((msg) {
       _statusMessage = msg;
@@ -477,29 +474,21 @@ class AppState extends ChangeNotifier {
     });
   }
 
-  /// El estadístico "última latencia"/"promedio" que se muestra en la UI
-  /// SOLO usa el RTT (medido enteramente con el reloj del propio emisor —
-  /// ver LatencyMetric.isRoundTrip). El "tránsito" que reporta el receptor
-  /// resta timestamps de DOS relojes distintos (emisor y receptor); si esos
-  /// relojes no están sincronizados, el resultado puede ser disparatado
-  /// (segundos u órdenes de magnitud de más) sin que eso sea un fallo del
-  /// DSP — es un problema de reloj, no de latencia real. Por eso el tránsito
-  /// solo se registra en el log (con su propia etiqueta), nunca en el
-  /// número principal.
+  /// Latencia por PING/PONG: RTT de un paquete de 12 B cada 2 s, medido
+  /// enteramente con el reloj del emisor del PING (inmune al desfase de
+  /// reloj entre los dos teléfonos) e independiente del flujo de audio —
+  /// mide el estado del canal aunque nadie hable.
   void _onLatencyMetric(LatencyMetric m) {
-    if (m.isRoundTrip) {
-      _lastLatencyMs = m.latencyMs;
-      _latencySumMs += m.latencyMs;
-      _burstCount++;
-    }
+    _lastLatencyMs = m.latencyMs;
+    _latencySumMs += m.latencyMs;
+    _burstCount++;
 
     final t = m.timestamp;
     final hh = t.hour.toString().padLeft(2, '0');
     final mm = t.minute.toString().padLeft(2, '0');
     final ss = t.second.toString().padLeft(2, '0');
-    final line = m.isRoundTrip
-        ? '[$hh:$mm:$ss] TX ráfaga #${m.burstId} → RTT ${m.latencyMs.toStringAsFixed(0)} ms'
-        : '[$hh:$mm:$ss] RX ráfaga #${m.burstId} → tránsito ${m.latencyMs.toStringAsFixed(0)} ms';
+    final line =
+        '[$hh:$mm:$ss] PING #${m.pingId} → RTT ${m.latencyMs.toStringAsFixed(0)} ms';
     _latencyLog.insert(0, line);
     if (_latencyLog.length > kMaxLogLines) _latencyLog.removeLast();
 

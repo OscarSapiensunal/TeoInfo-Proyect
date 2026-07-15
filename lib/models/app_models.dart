@@ -50,11 +50,16 @@ int parseSequenceNumber(Uint8List packet) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PROTOCOLO DE RÁFAGAS DE VOZ P2P (micrófono → BT → parlante)
+// PROTOCOLO DE VOZ P2P CONTINUO (micrófono → BT → parlante)
+//
+// v2 — "radio": la voz fluye en FRAMES pequeños (~128 ms) enviados apenas
+// se completan, no en ráfagas de 2 s. El diseño original de ráfagas exigía
+// acumular 2 s antes de enviar nada y reproducir por clips discretos con
+// ~0.2 s de arranque cada uno — el consumo era estructuralmente más lento
+// que la llegada y la latencia solo podía crecer. Con frames continuos +
+// reproducción streaming nativa (AudioTrack), la latencia extremo a extremo
+// queda acotada en ~0.5-1 s de forma permanente.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Duración de cada ráfaga de audio capturada del micrófono (ms).
-const int kBurstDurationMs = 2000;
 
 /// Formato de captura del micrófono: PCM lineal Int16 LE mono a 8 kHz.
 ///
@@ -70,10 +75,11 @@ const int kMicSampleRate = 8000;
 const int kMicNumChannels = 1;
 const int kMicBitsPerSample = 16;
 
-/// Bytes de PCM (lineal, ANTES del companding) por ráfaga:
-/// 8000 Hz × 1 ch × 2 B × 2 s = 32000 bytes → 16000 bytes μ-law al aire.
-const int kBurstPcmBytes =
-    kMicSampleRate * kMicNumChannels * (kMicBitsPerSample ~/ 8) * kBurstDurationMs ~/ 1000;
+/// Bytes de PCM lineal por FRAME de voz: 2040 B = exactamente un payload de
+/// paquete tras el companding μ-law (1020 B al aire). A 8 kHz mono Int16 son
+/// 127.5 ms de audio — la unidad de transmisión continua: cada frame sale al
+/// aire apenas el micrófono lo completa (~8 paquetes/s hablando).
+const int kFramePcmBytes = kPayloadSize * 2;
 
 /// Identificadores de códec para el meta-paquete (byte 8):
 /// el modo laboratorio (.wav) transmite PCM lineal tal cual; el modo voz
@@ -81,128 +87,59 @@ const int kBurstPcmBytes =
 const int kCodecPcm16 = 0;
 const int kCodecMuLaw = 1;
 
-/// Magic bytes de la cabecera de ráfaga (emisor → receptor).
-const int kBurstMagic0 = 0xCC;
-const int kBurstMagic1 = 0xEE;
+// ─────────────────────────────────────────────────────────────────────────────
+// PING/PONG — MEDICIÓN DE LATENCIA (RTT) DESACOPLADA DEL AUDIO
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Un PING minúsculo (12 B) viaja cada ~2 s con el reloj del emisor; el otro
+// lado lo devuelve como PONG con el mismo timestamp, y el emisor mide el RTT
+// con SU PROPIO reloj (inmune al desfase entre teléfonos). Reemplaza al ACK
+// por ráfaga del diseño v1: al no depender del audio, mide el estado del
+// canal aunque nadie hable, y no se infla con el tiempo de transmisión de
+// una ráfaga grande.
+//
+// NOTA HISTÓRICA (v1, retirado): existió un ARQ por ráfaga (NACK 0xCD,0xF0 +
+// reenvío desde caché). Se retiró tras confirmar en campo que sobre un canal
+// saturado la retransmisión REALIMENTA la congestión (reenvíos → más carga →
+// más pérdidas → más reenvíos) — el mismo fenómeno que motivó el control de
+// congestión de TCP. Queda documentado en README §9 como experimento.
 
-/// Magic bytes del ACK de ráfaga (receptor → emisor).
-const int kAckMagic0 = 0xCD;
-const int kAckMagic1 = 0xEF;
+/// Magic bytes del PING (quien mide → quien responde) y del PONG (respuesta).
+const int kPingMagic0 = 0xCE;
+const int kPingMagic1 = 0xF1;
+const int kPongMagic1 = 0xF2;
 
-/// Tamaño fijo del paquete ACK:
-/// [0xCD, 0xEF, ID_HI, ID_LO, txEpochMs(u64 LE), rxEpochMs(u64 LE)] = 20 bytes.
-const int kAckPacketSize = 20;
+/// Tamaño fijo de PING/PONG: [0xCE, 0xF1|0xF2, ID_HI, ID_LO, t0(u64 LE)] = 12 B.
+const int kPingPacketSize = 12;
 
-/// Construye la cabecera de ráfaga (ocupa un paquete completo, con relleno).
-/// Estructura: [0xCC, 0xEE, ID_HI, ID_LO, byteLen(u32 LE), txEpochMs(u64 LE), 0…]
-Uint8List buildBurstHeaderPacket({
-  required int burstId,
-  required int pcmByteLength,
-  required int txEpochMs,
-}) {
-  final packet = Uint8List(kPacketSize);
-  packet[0] = kBurstMagic0;
-  packet[1] = kBurstMagic1;
-  packet[2] = (burstId >> 8) & 0xFF;
-  packet[3] = burstId & 0xFF;
-  final view = ByteData.sublistView(packet);
-  view.setUint32(4, pcmByteLength, Endian.little);
-  view.setUint64(8, txEpochMs, Endian.little);
+Uint8List _buildPingLike(int magic1, int pingId, int epochMs) {
+  final packet = Uint8List(kPingPacketSize);
+  packet[0] = kPingMagic0;
+  packet[1] = magic1;
+  packet[2] = (pingId >> 8) & 0xFF;
+  packet[3] = pingId & 0xFF;
+  ByteData.sublistView(packet).setUint64(4, epochMs, Endian.little);
   return packet;
 }
 
-/// Cabecera de ráfaga parseada.
-class BurstHeader {
-  final int burstId;
-  final int pcmByteLength;
-  final int txEpochMs;
+Uint8List buildPingPacket({required int pingId, required int epochMs}) =>
+    _buildPingLike(kPingMagic1, pingId, epochMs);
 
-  const BurstHeader({
-    required this.burstId,
-    required this.pcmByteLength,
-    required this.txEpochMs,
-  });
+/// El PONG devuelve el MISMO timestamp del PING (el reloj del receptor no
+/// participa — por eso el RTT resultante no sufre el desfase entre relojes).
+Uint8List buildPongPacket({required int pingId, required int epochMs}) =>
+    _buildPingLike(kPongMagic1, pingId, epochMs);
 
-  static BurstHeader parse(Uint8List packet) {
-    final view = ByteData.sublistView(packet);
-    return BurstHeader(
-      burstId: (packet[2] << 8) | packet[3],
-      pcmByteLength: view.getUint32(4, Endian.little),
-      txEpochMs: view.getUint64(8, Endian.little),
-    );
-  }
-}
+/// PING o PONG parseado.
+class PingPong {
+  final int pingId;
+  final int epochMs;
+  const PingPong({required this.pingId, required this.epochMs});
 
-/// Construye el paquete ACK que el receptor devuelve al completar una ráfaga.
-Uint8List buildAckPacket({
-  required int burstId,
-  required int txEpochMs,
-  required int rxEpochMs,
-}) {
-  final ack = Uint8List(kAckPacketSize);
-  ack[0] = kAckMagic0;
-  ack[1] = kAckMagic1;
-  ack[2] = (burstId >> 8) & 0xFF;
-  ack[3] = burstId & 0xFF;
-  final view = ByteData.sublistView(ack);
-  view.setUint64(4, txEpochMs, Endian.little);
-  view.setUint64(12, rxEpochMs, Endian.little);
-  return ack;
-}
-
-/// ACK de ráfaga parseado.
-class BurstAck {
-  final int burstId;
-  final int txEpochMs;
-  final int rxEpochMs;
-
-  const BurstAck({
-    required this.burstId,
-    required this.txEpochMs,
-    required this.rxEpochMs,
-  });
-
-  static BurstAck parse(Uint8List bytes) {
-    final view = ByteData.sublistView(bytes);
-    return BurstAck(
-      burstId: (bytes[2] << 8) | bytes[3],
-      txEpochMs: view.getUint64(4, Endian.little),
-      rxEpochMs: view.getUint64(12, Endian.little),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ARQ — SOLICITUD DE RETRANSMISIÓN (NACK) DE UNA RÁFAGA (Cap. V)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Magic bytes de la solicitud de retransmisión (receptor → emisor).
-const int kNackMagic0 = 0xCD;
-const int kNackMagic1 = 0xF0;
-
-/// Tamaño fijo del paquete NACK: [0xCD, 0xF0, ID_HI, ID_LO] = 4 bytes.
-const int kNackPacketSize = 4;
-
-/// Construye la solicitud de retransmisión de la ráfaga [burstId] completa.
-/// Se pide la ráfaga entera (no paquetes individuales) porque el emisor solo
-/// guarda en caché la ÚLTIMA ráfaga enviada — más simple y suficiente dado
-/// que las pérdidas observadas tienden a ocurrir en ráfagas completas.
-Uint8List buildNackPacket({required int burstId}) {
-  final packet = Uint8List(kNackPacketSize);
-  packet[0] = kNackMagic0;
-  packet[1] = kNackMagic1;
-  packet[2] = (burstId >> 8) & 0xFF;
-  packet[3] = burstId & 0xFF;
-  return packet;
-}
-
-/// Solicitud de retransmisión parseada.
-class NackRequest {
-  final int burstId;
-  const NackRequest({required this.burstId});
-
-  static NackRequest parse(Uint8List packet) =>
-      NackRequest(burstId: (packet[2] << 8) | packet[3]);
+  static PingPong parse(Uint8List packet) => PingPong(
+        pingId: (packet[2] << 8) | packet[3],
+        epochMs: ByteData.sublistView(packet).getUint64(4, Endian.little),
+      );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,17 +173,11 @@ class SignalOptimizationSettings {
   /// corrigen esos bits con Hamming o si se dejan corrompidos (clics/pops).
   final bool fecEnabled;
 
-  /// ARQ: al detectar un hueco de secuencia, pide al emisor reenviar la
-  /// ráfaga completa (si el emisor todavía la tiene en caché) en vez de
-  /// conformarse con la concealment de PLC.
-  final bool arqEnabled;
-
   const SignalOptimizationSettings({
     this.plcEnabled = false,
     this.filterEnabled = false,
     this.aecEnabled = false,
     this.fecEnabled = false,
-    this.arqEnabled = false,
   });
 
   /// Señal "cruda": todas las mitigaciones apagadas (estado inicial de cada sesión).
@@ -258,52 +189,44 @@ class SignalOptimizationSettings {
     filterEnabled: true,
     aecEnabled: true,
     fecEnabled: true,
-    arqEnabled: true,
   );
 
   bool get allEnabled =>
-      plcEnabled && filterEnabled && aecEnabled && fecEnabled && arqEnabled;
+      plcEnabled && filterEnabled && aecEnabled && fecEnabled;
   bool get allDisabled =>
-      !plcEnabled && !filterEnabled && !aecEnabled && !fecEnabled && !arqEnabled;
+      !plcEnabled && !filterEnabled && !aecEnabled && !fecEnabled;
 
   SignalOptimizationSettings copyWith({
     bool? plcEnabled,
     bool? filterEnabled,
     bool? aecEnabled,
     bool? fecEnabled,
-    bool? arqEnabled,
   }) {
     return SignalOptimizationSettings(
       plcEnabled: plcEnabled ?? this.plcEnabled,
       filterEnabled: filterEnabled ?? this.filterEnabled,
       aecEnabled: aecEnabled ?? this.aecEnabled,
       fecEnabled: fecEnabled ?? this.fecEnabled,
-      arqEnabled: arqEnabled ?? this.arqEnabled,
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MÉTRICA DE LATENCIA POR RÁFAGA
+// MÉTRICA DE LATENCIA (RTT medido por PING/PONG)
 // ─────────────────────────────────────────────────────────────────────────────
 
 class LatencyMetric {
-  final int burstId;
+  final int pingId;
 
-  /// Latencia medida en milisegundos.
+  /// RTT en milisegundos, medido enteramente con el reloj del emisor del
+  /// PING (inmune al desfase de reloj entre los dos teléfonos).
   final double latencyMs;
-
-  /// true  → RTT medido por el emisor con su propio reloj (header → ACK).
-  /// false → tránsito estimado por el receptor (epoch TX vs epoch RX;
-  ///         sujeto al desfase de reloj entre teléfonos).
-  final bool isRoundTrip;
 
   final DateTime timestamp;
 
   const LatencyMetric({
-    required this.burstId,
+    required this.pingId,
     required this.latencyMs,
-    required this.isRoundTrip,
     required this.timestamp,
   });
 }
@@ -363,11 +286,6 @@ class ChannelMetrics {
   /// Número de paquetes perdidos (saltos en secuencia detectados).
   final int packetsLost;
 
-  /// Número de paquetes recuperados por ARQ (retransmisión exitosa de una
-  /// ráfaga que tenía huecos) — subconjunto de lo que se contó en
-  /// [packetsLost] al detectarse el hueco.
-  final int packetsRecovered;
-
   /// Marca de tiempo de la muestra.
   final DateTime timestamp;
 
@@ -378,7 +296,6 @@ class ChannelMetrics {
     required this.bufferFillRatio,
     required this.packetsReceived,
     required this.packetsLost,
-    this.packetsRecovered = 0,
     required this.timestamp,
   });
 
@@ -389,7 +306,6 @@ class ChannelMetrics {
     double? bufferFillRatio,
     int? packetsReceived,
     int? packetsLost,
-    int? packetsRecovered,
     DateTime? timestamp,
   }) {
     return ChannelMetrics(
@@ -399,7 +315,6 @@ class ChannelMetrics {
       bufferFillRatio: bufferFillRatio ?? this.bufferFillRatio,
       packetsReceived: packetsReceived ?? this.packetsReceived,
       packetsLost: packetsLost ?? this.packetsLost,
-      packetsRecovered: packetsRecovered ?? this.packetsRecovered,
       timestamp: timestamp ?? this.timestamp,
     );
   }

@@ -1,7 +1,7 @@
 // test/widget_test.dart
 //
-// Pruebas unitarias del protocolo de paquetes BT (ráfagas P2P y ACK) y del
-// Jitter Buffer del DspProcessor.
+// Pruebas unitarias del protocolo de paquetes BT (voz continua + PING/PONG),
+// del Jitter Buffer del DspProcessor y de los códecs (Hamming, μ-law).
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -22,41 +22,32 @@ void main() {
     expect(parseSequenceNumber(packet), 0x1234);
   });
 
-  test('Cabecera de ráfaga: build + parse', () {
-    final txEpoch = DateTime.now().millisecondsSinceEpoch;
-    final packet = buildBurstHeaderPacket(
-      burstId: 42,
-      pcmByteLength: kBurstPcmBytes,
-      txEpochMs: txEpoch,
-    );
+  test('PING/PONG: build + parse con el mismo timestamp', () {
+    final t0 = DateTime.now().millisecondsSinceEpoch;
 
-    expect(packet.length, kPacketSize);
-    expect(packet[0], kBurstMagic0);
-    expect(packet[1], kBurstMagic1);
+    final ping = buildPingPacket(pingId: 42, epochMs: t0);
+    expect(ping.length, kPingPacketSize);
+    expect(ping[0], kPingMagic0);
+    expect(ping[1], kPingMagic1);
+    final parsedPing = PingPong.parse(ping);
+    expect(parsedPing.pingId, 42);
+    expect(parsedPing.epochMs, t0);
 
-    final header = BurstHeader.parse(packet);
-    expect(header.burstId, 42);
-    expect(header.pcmByteLength, kBurstPcmBytes);
-    expect(header.txEpochMs, txEpoch);
+    // El PONG debe devolver el MISMO timestamp (el reloj del receptor no
+    // participa — de ahí que el RTT no sufra el desfase entre relojes).
+    final pong =
+        buildPongPacket(pingId: parsedPing.pingId, epochMs: parsedPing.epochMs);
+    expect(pong.length, kPingPacketSize);
+    expect(pong[0], kPingMagic0);
+    expect(pong[1], kPongMagic1);
+    final parsedPong = PingPong.parse(pong);
+    expect(parsedPong.pingId, 42);
+    expect(parsedPong.epochMs, t0);
   });
 
-  test('ACK de ráfaga: build + parse', () {
-    final tx = DateTime.now().millisecondsSinceEpoch;
-    final rx = tx + 137;
-    final ack = buildAckPacket(burstId: 7, txEpochMs: tx, rxEpochMs: rx);
-
-    expect(ack.length, kAckPacketSize);
-    expect(ack[0], kAckMagic0);
-    expect(ack[1], kAckMagic1);
-
-    final parsed = BurstAck.parse(ack);
-    expect(parsed.burstId, 7);
-    expect(parsed.txEpochMs, tx);
-    expect(parsed.rxEpochMs, rx);
-  });
-
-  test('Tamaño de ráfaga: 2 s de PCM 8 kHz mono Int16 = 32000 bytes', () {
-    expect(kBurstPcmBytes, 32000);
+  test('Frame de voz: 2040 B de PCM = 1020 B μ-law = un payload exacto', () {
+    expect(kFramePcmBytes, kPayloadSize * 2);
+    expect(kFramePcmBytes, 2040);
   });
 
   test('Jitter Buffer: processBlock encola sin auto-extraer (fillRatio real)', () {

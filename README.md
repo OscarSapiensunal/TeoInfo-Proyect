@@ -75,7 +75,7 @@ Conceptos del curso directamente aplicados:
 | **Capacidad de canal de Shannon-Hartley** (Cap. IV) | `C = B·log2(1+SNR)` calculada en vivo: `B` = ancho de banda de Nyquist del muestreo, `SNR` estimado como el RSSI actual sobre un piso de ruido asumido de −95 dBm (`information_theory.dart`). Mostrada junto al RSSI para comparar capacidad teórica contra el throughput real observado. |
 | **Entropía de la fuente** (Cap. IV 4.2) | `H(X) = −Σp(x)·log2(p(x))` estimada por histograma de 256 bins sobre cada clip de voz reproducido, contrastada contra la entropía máxima log2(256)=8 bits/muestra (ruido blanco uniforme) — la voz real siempre da menos, por sus silencios y su distribución de amplitud concentrada. |
 | **Corrección de errores hacia adelante — FEC** (Cap. V) | Código de Hamming (7,4) implementado a mano (`error_correction.dart`): 4 bits de datos → 7 bits con 3 de paridad: `p1=d1⊕d2⊕d4, p2=d1⊕d3⊕d4, p3=d2⊕d3⊕d4`. El síndrome de paridad en el receptor apunta directo a la posición del bit volteado y lo corrige sin pedir reenvío. |
-| **ARQ — repetición automática bajo pedido** (Cap. V) | Al detectar un hueco de secuencia, el receptor envía un NACK pidiendo la ráfaga completa; el emisor, si aún la tiene en caché, la reenvía. Complementa al FEC: FEC corrige bits aislados sin esperar; ARQ recupera pérdidas completas al costo de una ida y vuelta. |
+| **ARQ — repetición automática bajo pedido** (Cap. V) — *explorado y RETIRADO* | Se implementó (NACK + reenvío desde caché) y se retiró tras confirmar en campo que sobre un canal saturado la retransmisión REALIMENTA la congestión (reenvíos → más carga → más pérdidas → más reenvíos), el mismo fenómeno que motivó el control de congestión de TCP. Para voz en tiempo real, la industria usa FEC + concealment, no ARQ — llegar a esa conclusión midiendo es un resultado del proyecto (ver dificultad 13). |
 
 **Qué es implementación propia y qué es infraestructura de terceros** (transparencia metodológica):
 
@@ -130,11 +130,11 @@ documenta ese proceso.
 ┌───────────────────┐                                      ┌────────────────────┐
 │ Micrófono         │                                      │ Parlante           │
 │   ↓ ADC           │      Bluetooth Clásico RFCOMM        │   ↑ DAC            │
-│ PCM 8kHz/16bit    │   (real: pérdidas, RSSI variable)    │ Clips de ~2 s      │
-│   ↓ μ-law (8bit)  │                                      │   ↑ μ-law → PCM    │
-│ Ráfagas de 2 s    │  ────────  paquetes 1024 B  ───────► │ Jitter buffer      │
-│ (16000 B al aire) │                                      │   ↑                │
-│   ↓               │  ◄────────  ACK (20 B)  ───────────  │ DSP: PLC+AWGN+LP   │
+│ PCM 8kHz/16bit    │   (real: pérdidas, RSSI variable)    │ AudioTrack nativo  │
+│   ↓ μ-law (8bit)  │                                      │ (streaming real)   │
+│ Frames de ~128 ms │  ────────  paquetes 1024 B  ───────► │   ↑ μ-law → PCM    │
+│ (VAD: el silencio │      ~8 paquetes/s hablando          │ Jitter buffer      │
+│  no viaja)        │  ◄──────  PING/PONG (12 B/2 s)  ───  │ DSP: PLC+AWGN+LP   │
 │ SEQ + timestamp   │                                      │   ↑                │
 └───────────────────┘                                      │ Detección pérdidas │
      (y viceversa: el enlace es full-duplex,               └────────────────────┘
@@ -157,7 +157,8 @@ lib/
 │   ├── rfcomm_server.dart             # Wrapper Dart del servidor SPP nativo
 │   ├── rssi_channel.dart              # MethodChannel hacia la lectura de RSSI real (GATT)
 │   ├── audio_capture_service.dart     # Micrófono → stream PCM (flutter_sound Recorder)
-│   └── audio_player_service.dart      # Reproducción por clips discretos encolados
+│   ├── native_audio_player.dart       # Wrapper del AudioTrack streaming nativo
+│   └── system_channel.dart            # Mantener pantalla encendida en sesión
 ├── dsp/
 │   ├── dsp_processor.dart             # Jitter Buffer, PLC, AWGN, filtros IIR+FIR (todo a mano)
 │   ├── echo_canceller.dart            # Cancelador de eco NLMS + semi-dúplex (todo a mano)
@@ -293,20 +294,27 @@ la ventana de reconocimiento cubre 2 ráfagas completas (128 paquetes) para
 que el reenvío se reconozca aunque llegue después de que la siguiente
 ráfaga ya haya empezado.
 
-### Ráfagas de voz y latencia
+### Transmisión continua ("radio") y latencia
 
-- Captura PCM Int16 LE, **8 kHz mono** → ráfagas de **2 s = 32 000 bytes**
-  de PCM lineal → **16 000 bytes al aire tras companding μ-law** (16
-  paquetes de 1020 B, el último con relleno de silencio μ-law 0xFF — no
-  ceros binarios, que en μ-law decodifican a casi fondo de escala).
-- Cada ráfaga viaja precedida de su cabecera con `txEpochMs` del emisor.
-- **Latencia en el receptor:** `rxEpochMs − txEpochMs` al completar la ráfaga
-  (estimación sujeta al desfase de reloj entre teléfonos).
-- **Latencia en el emisor (RTT):** el receptor responde ACK por el mismo
-  socket; el emisor mide `ahora − txEpochMs` con su propio reloj (sin
-  problema de sincronización). Incluye el tiempo de transmisión del bloque.
-- Ambas se muestran en el panel de latencias de la UI y se imprimen en
-  `logcat` — insumos de la sección 8.
+- Captura PCM Int16 LE, **8 kHz mono** → **frames de 2 040 B (~128 ms)** →
+  **1 020 B al aire tras companding μ-law** = exactamente un payload de
+  paquete. Cada frame sale apenas el micrófono lo completa (~8 paquetes/s
+  hablando) — no hay acumulación previa de ningún tipo.
+- **VAD**: frames por debajo del umbral de energía no se transmiten (con
+  hangover de ~0.5 s para no amputar la cola de las frases).
+- **Backpressure por frame**: máximo 8 frames (~1 s) esperando turno; el
+  excedente se descarta en el emisor — la latencia de TX queda acotada por
+  diseño.
+- **Latencia (RTT)**: un PING de 12 B viaja cada 2 s con el reloj del
+  emisor; el otro lado lo devuelve como PONG con el mismo timestamp y el
+  emisor mide `ahora − t0` con su propio reloj (inmune al desfase entre
+  teléfonos). Al ser independiente del audio, mide el canal aunque nadie
+  hable.
+- **Reproducción**: streaming real con AudioTrack nativo propio (Kotlin,
+  MODE_STREAM, un solo hilo escritor, cola acotada drop-oldest) — consume
+  a tiempo real exacto, sin el ~0.2 s de arranque por clip del mecanismo
+  anterior. Latencia extremo a extremo típica: **~0.5-1 s, acotada de
+  forma permanente** (cada etapa del pipeline tiene tope con drop-oldest).
 
 ### Pipeline DSP (receptor)
 
@@ -519,6 +527,28 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    recientes, de modo que el indicador (aunque marcado como simulado) se
    mueve CON el canal en vez de mostrar una señal "sana" mientras el
    enlace agoniza.
+13. **Rediseño v2 — "radio" continua: el enemigo era la arquitectura, no
+   los parámetros.** Tras todas las mitigaciones anteriores la latencia
+   seguía escalando. La razón de fondo: (a) el diseño por ráfagas exigía
+   acumular 2 s antes de enviar nada, y (b) la reproducción por clips
+   discretos cobraba ~0.2 s de arranque por clip — reproducir 2 s tardaba
+   ~2.2 s, el consumo era ESTRUCTURALMENTE más lento que la llegada, y
+   ningún ahorro de ancho de banda podía compensar un consumidor más lento
+   que el productor. Rediseño: (1) transmisión CONTINUA por frames de
+   ~128 ms (un frame = un paquete, sale apenas se completa); (2)
+   reproducción streaming real con **AudioTrack nativo propio** en Kotlin
+   (MODE_STREAM, un único hilo escritor — elimina la concurrencia que
+   causaba el SIGSEGV de flutter_sound — y cola acotada drop-oldest);
+   (3) latencia medida por PING/PONG de 12 B cada 2 s, independiente del
+   audio; (4) ARQ retirado (ver marco teórico). Resultado: cada etapa del
+   pipeline tiene tope con drop-oldest y la latencia extremo a extremo
+   queda acotada en ~0.5-1 s de forma permanente. Lección de diseño: en
+   tiempo real, el requisito no negociable es que el consumidor sea al
+   menos tan rápido como el productor — todo lo demás se negocia.
+
+---
+
+## 10. Conclusiones (síntesis sugerida para el informe)
 
 1. Se implementó un sistema de comunicación digital de voz funcional de
    extremo a extremo sobre un canal inalámbrico real, cumpliendo el objetivo
