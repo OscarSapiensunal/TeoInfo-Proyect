@@ -66,10 +66,14 @@ const double kVadRmsThreshold = 0.006;
 const int kVadHangoverFrames = 4;
 
 /// Cola del semi-dúplex (ms): el micrófono se mantiene silenciado un
-/// momento DESPUÉS de que el parlante termina, para no captar la
-/// reverberación de la sala ni el desinfle del control automático de
-/// ganancia — las colas de eco que se escapaban justo al liberar el gate.
-const int kAecGateHangoverMs = 300;
+/// momento DESPUÉS de que el parlante termina. Cubre dos fuentes de eco
+/// residual: (1) la reverberación de la sala y el desinfle del control
+/// automático de ganancia, y (2) — la más traicionera — el BUFFERING del
+/// pipeline de captura: los chunks del micrófono llegan a Dart 100-300 ms
+/// después de haberse capturado, así que al liberar el gate por hora de
+/// LLEGADA todavía entran chunks capturados MIENTRAS el parlante sonaba
+/// (era el eco que "se escapaba" con el hangover de 300 ms).
+const int kAecGateHangoverMs = 600;
 
 
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo
@@ -201,6 +205,8 @@ class BluetoothManager {
   bool _rssiIsReal = false;
   Timer? _rssiTimer;
   bool _rssiPollBusy = false;
+  int _rssiFailStreak = 0;
+  int _rssiTickCount = 0;
   final math.Random _rssiRng = math.Random();
 
   // ── Buffer de reensamblado de paquetes (el socket BT puede fragmentar) ─────
@@ -1033,6 +1039,8 @@ class BluetoothManager {
   /// versión anterior que solo restaba y por eso el RSSI SIEMPRE bajaba.
   void _startRssiPolling(String address) {
     _rssiTimer?.cancel();
+    _rssiFailStreak = 0;
+    _rssiTickCount = 0;
     _rssiTimer = Timer.periodic(
       const Duration(milliseconds: kRssiPollIntervalMs),
       (_) async {
@@ -1042,10 +1050,25 @@ class BluetoothManager {
         // dispositivo — cada una consume un handle del sistema.
         if (_rssiPollBusy) return;
         _rssiPollBusy = true;
+        _rssiTickCount++;
+
+        // HIGIENE DE RADIO (mejora de la CONEXIÓN, no del mensaje): cada
+        // intento de lectura real es una conexión GATT completa que compite
+        // por la radio de 2.4 GHz con el propio enlace de voz. Si el
+        // teléfono remoto claramente no la soporta (3 fallos seguidos),
+        // insistir cada 5 s solo le roba airtime al audio — se baja a un
+        // reintento cada ~15 s por si acaso, y se simula el resto.
+        final bool tryRealRead =
+            _rssiFailStreak < 3 || _rssiTickCount % 3 == 0;
         try {
+          if (!tryRealRead) {
+            throw StateError('backoff GATT: sin intento real este tick');
+          }
           _currentRssi = await RssiChannel.getRssi(address);
           _rssiIsReal = true;
+          _rssiFailStreak = 0;
         } catch (_) {
+          if (tryRealRead) _rssiFailStreak++;
           _rssiIsReal = false;
           // Simulación guiada por la salud REAL del enlace: el valor
           // persigue un objetivo derivado de las pérdidas y la saturación

@@ -366,8 +366,8 @@ Socket RFCOMM
 | `kRssiWeakThreshold` | −75 dBm | Umbral para activar PLC + ruido |
 | `kRssiCriticalThreshold` | −88 dBm | Umbral de señal crítica |
 | `kPlcAttenuationFactor` | 0.707 | Atenuación por repetición PLC (−3 dB) |
-| `kIirAlpha` | 0.15 | Coeficiente del filtro IIR paso-bajos |
-| `kMovingAvgOrder` | 5 | Orden del filtro FIR de promedio móvil |
+| `kIirAlpha` | 0.85 | Coeficiente del filtro IIR paso-bajos (fc ≈ 2.4 kHz a 8 kHz — recalibrado: el 0.15 original venía de 44.1 kHz y a 8 kHz cortaba desde ~190 Hz, amputando la voz; ver dificultad 14) |
+| `kMovingAvgOrder` | 2 | Orden del filtro FIR de promedio móvil (el 5 original ponía su nulo en 1.6 kHz, dentro de la banda de voz) |
 
 ---
 
@@ -393,6 +393,16 @@ antes de conectar — transmite ese archivo en vez del micrófono, útil para
 repetir el experimento con una señal de referencia idéntica en cada corrida.
 Se recomienda un WAV de 16 kHz mono 16 bits (el throughput de RFCOMM,
 ~90 KB/s, no alcanza para 44.1 kHz estéreo en tiempo real: 176 KB/s).
+
+**Higiene de radio para la demo (mejora la CONEXIÓN, no el mensaje):**
+Bluetooth y Wi-Fi comparten la banda de 2.4 GHz (y en el teléfono, muchas
+veces la misma antena). Para el mejor enlace posible durante la demo:
+- Apagar el Wi-Fi (o al menos el hotspot) de ambos teléfonos.
+- No tapar los teléfonos con el cuerpo ni metérselos al bolsillo (el cuerpo
+  humano atenúa ~10 dB a 2.4 GHz).
+- Lejos de microondas encendidos y de routers Wi-Fi muy activos.
+- Desconectar audífonos/parlantes Bluetooth de ambos teléfonos (comparten
+  el mismo controlador de radio con nuestro enlace).
 
 **Evidencias sugeridas:** capturas del dashboard en 3 distancias (cerca /
 media / límite de cobertura), foto del montaje, video corto de la
@@ -545,6 +555,20 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    queda acotada en ~0.5-1 s de forma permanente. Lección de diseño: en
    tiempo real, el requisito no negociable es que el consumidor sea al
    menos tan rápido como el productor — todo lo demás se negocia.
+14. **"Los filtros empeoran la señal": coeficientes sin recalibrar tras
+   cambiar la frecuencia de muestreo.** El IIR con α=0.15 se diseñó cuando
+   el audio iba a 44.1 kHz (fc ≈ 1 kHz); al bajar el muestreo a 8 kHz ese
+   MISMO α pasó a cortar desde ~190 Hz — en plena banda de la voz
+   (300-3400 Hz). El "filtro anti-ruido" no limpiaba nada: amputaba la
+   voz. Igual el FIR de orden 5 (primer nulo en fs/5 = 1.6 kHz).
+   Recalibrado: α=0.85 (fc ≈ 2.4 kHz) y orden 2. Lección de DSP directa
+   del Cap. II: los coeficientes de un filtro digital solo significan algo
+   RELATIVO a la frecuencia de muestreo — cambiar fs sin recalcularlos
+   cambia el filtro por completo. Del mismo lote: el gate del AEC se
+   liberaba por hora de LLEGADA del chunk del micrófono, pero la captura
+   llega a la app 100-300 ms después de capturarse — al abrir el gate aún
+   entraban chunks grabados mientras el parlante sonaba (eco residual);
+   el hangover pasó de 300 a 600 ms para cubrir ese buffering.
 
 ---
 

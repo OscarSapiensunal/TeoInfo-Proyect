@@ -46,12 +46,23 @@ const double kRssiCriticalThreshold = -88.0;
 const double kPlcAttenuationFactor = 0.707;
 
 /// Coeficiente del filtro IIR paso-bajos.
-/// y[n] = α·x[n] + (1-α)·y[n-1]
-/// α = 0.15 → fc ≈ sampleRate * α / (2π) ≈ 1060 Hz para 44100 Hz
-const double kIirAlpha = 0.15;
+/// y[n] = α·x[n] + (1-α)·y[n-1]  →  fc ≈ −fs·ln(1−α)/(2π)
+///
+/// RECALIBRADO PARA 8 kHz: α = 0.85 → fc ≈ 2.4 kHz — conserva la banda de
+/// la voz (300-3400 Hz) y atenúa el silbido del AWGN por encima. El valor
+/// original (0.15) venía de la época de 44.1 kHz; al bajar el muestreo a
+/// 8 kHz ese mismo α pasó a cortar desde ~190 Hz, EN PLENA banda de voz —
+/// el "filtro" no limpiaba el ruido: amputaba la voz (reportado en campo
+/// como "los filtros empeoran la señal"). Lección de DSP: los coeficientes
+/// de un filtro digital solo tienen sentido RELATIVOS a la frecuencia de
+/// muestreo — cambiar fs sin recalcularlos cambia el filtro por completo.
+const double kIirAlpha = 0.85;
 
 /// Orden del filtro de promedio móvil (FIR) para segunda pasada.
-const int kMovingAvgOrder = 5;
+/// Orden 2 a 8 kHz: caída suave hacia Nyquist (nulo en 4 kHz), fuera de la
+/// banda útil. El orden 5 original ponía su primer nulo en fs/5 = 1.6 kHz —
+/// dentro de la voz (misma lección que kIirAlpha).
+const int kMovingAvgOrder = 2;
 
 /// Tasa MÁXIMA de bit-error simulada (por bit) para el demo de FEC, alcanzada
 /// en el peor caso de degradación de RSSI. Bluetooth Clásico ya protege el
