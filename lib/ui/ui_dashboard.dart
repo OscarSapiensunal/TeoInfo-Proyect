@@ -203,16 +203,15 @@ class _MicToggleCard extends StatelessWidget {
     final state = context.watch<AppState>();
 
     return _Card(
-      title: 'MICRÓFONO',
+      title: 'MI MICRÓFONO',
       icon: Icons.mic_rounded,
       child: Row(
         children: [
           Expanded(
             child: Text(
               state.micEnabled
-                  ? 'Encendido: lo que digas se envía al otro teléfono '
-                      '(el silencio no se transmite).'
-                  : 'Apagado: solo escuchas.',
+                  ? 'Activo: transmisión continua (solo viaja cuando hablas — VAD).'
+                  : 'Silenciado: solo escuchas.',
               style: const TextStyle(color: _C.textMuted, fontSize: 12),
             ),
           ),
@@ -261,9 +260,8 @@ class _ConnectCard extends StatelessWidget {
                 const SizedBox(width: 6),
                 const Expanded(
                   child: Text(
-                    'Modo laboratorio: enviar un archivo de audio (.wav) en '
-                    'lugar del micrófono — señal de prueba repetible. Aplica '
-                    'para el teléfono que espera la conexión.',
+                    'Modo laboratorio: transmitir un archivo .wav en vez de mi voz '
+                    '(solo aplica si espero la conexión)',
                     style: TextStyle(color: _C.textMuted, fontSize: 11),
                   ),
                 ),
@@ -598,22 +596,22 @@ class _SignalOptimizationCard extends StatelessWidget {
               ),
               children: [
                 _OptimizationSwitchRow(
-                  label: 'PLC — rellena los huecos si se pierden paquetes',
+                  label: 'PLC — repone paquetes perdidos',
                   value: s.plcEnabled,
                   onChanged: (v) => state.setIndividualOptimization(plc: v),
                 ),
                 _OptimizationSwitchRow(
-                  label: 'Filtro (IIR+FIR) — limpia el ruido del canal',
+                  label: 'Filtro IIR/FIR — limpia el ruido inyectado',
                   value: s.filterEnabled,
                   onChanged: (v) => state.setIndividualOptimization(filter: v),
                 ),
                 _OptimizationSwitchRow(
-                  label: 'Anti-eco — pausa el micrófono mientras suena el parlante',
+                  label: 'AEC — cancelación de eco de hardware (como una llamada)',
                   value: s.aecEnabled,
                   onChanged: (v) => state.setIndividualOptimization(aec: v),
                 ),
                 _OptimizationSwitchRow(
-                  label: 'FEC (Hamming) — corrige bits dañados sin retransmitir',
+                  label: 'FEC (Hamming 7,4) — corrige bits corruptos',
                   value: s.fecEnabled,
                   onChanged: (v) => state.setIndividualOptimization(fec: v),
                 ),
@@ -673,7 +671,7 @@ class _LatencyCard extends StatelessWidget {
     if (!state.isActive) return const SizedBox.shrink();
 
     return _Card(
-      title: 'LATENCIA DEL ENLACE',
+      title: 'LATENCIA DEL ENLACE (RTT)',
       icon: Icons.timer_outlined,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -687,7 +685,7 @@ class _LatencyCard extends StatelessWidget {
           Row(
             children: [
               _MetricTile(
-                label: 'ÚLTIMA (RTT)',
+                label: 'ÚLT. LATENCIA (RTT)',
                 value: state.lastLatencyMs != null
                     ? '${state.lastLatencyMs!.toStringAsFixed(0)} ms'
                     : '—',
@@ -705,7 +703,7 @@ class _LatencyCard extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               _MetricTile(
-                label: 'MEDICIONES',
+                label: 'PINGS',
                 value: '${state.burstCount}',
                 icon: Icons.stacked_bar_chart_rounded,
                 color: _C.accentGreen,
@@ -956,7 +954,7 @@ class _AlgorithmLogCard extends StatelessWidget {
     final log = state.algorithmLog;
 
     return _Card(
-      title: 'ALGORITMOS EN ACCIÓN',
+      title: 'LOG DE ALGORITMOS EN VIVO',
       icon: Icons.terminal_rounded,
       child: Container(
         width: double.infinity,
@@ -970,9 +968,8 @@ class _AlgorithmLogCard extends StatelessWidget {
         child: log.isEmpty
             ? const Center(
                 child: Text(
-                  'Aquí aparece cada decisión del sistema en vivo: cuándo '
-                  'detecta tu voz, cuándo rellena una pérdida, cuándo actúa '
-                  'el anti-eco… Habla para verlo en marcha.',
+                  'Sin eventos aún… habla o reproduce el .wav para ver VAD, '
+                  'PLC, AEC y AWGN/filtros actuar en vivo.',
                   style: TextStyle(color: _C.textMuted, fontSize: 11),
                   textAlign: TextAlign.center,
                 ),

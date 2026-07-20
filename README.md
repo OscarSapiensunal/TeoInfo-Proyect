@@ -595,6 +595,21 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    y la reproducción al camino de comunicación, el mismo cancelador que
    usan las apps de VoIP trabaja para nosotros, con el semi-dúplex como
    capa de respaldo conmutable.
+16. **El toggle de AEC quedó invertido en la práctica — y el gate murió.**
+   Tras la dif. 15, el AEC de hardware quedó SIEMPRE activo (la fuente de
+   captura era fija) y el toggle solo controlaba el gate semi-dúplex. En
+   campo: "sin optimizar" NO tenía eco (el hardware lo cancelaba solo) y
+   al activar el toggle APARECÍA un pseudo-eco — las transiciones del gate
+   (apertura basada en una estimación del fin de reproducción + hangover)
+   dejaban escapar ráfagas del arranque de cada frase ajena. Arreglo
+   final: el toggle AEC conmuta la FUENTE de captura (micrófono crudo ↔
+   VOICE_COMMUNICATION), reiniciando la grabadora en vivo (~0.3 s), y el
+   gate por software se retiró — full-dúplex real. Con esto el contraste
+   pedagógico vuelve a ser el correcto: sin optimizar el eco SE ESCUCHA
+   (micrófono crudo), optimizado lo cancela el hardware. Tercer
+   experimento retirado con justificación medida (NLMS, ARQ, gate) — el
+   patrón del proyecto: cada capa de mitigación se valida contra el campo,
+   no contra la intuición.
 
 ---
 

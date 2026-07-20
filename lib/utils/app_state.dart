@@ -94,11 +94,23 @@ class AppState extends ChangeNotifier {
 
   /// Switch maestro: enciende o apaga TODAS las mitigaciones a la vez.
   void setSignalOptimizationEnabled(bool enabled) {
+    final bool aecChanged = _signalSettings.aecEnabled != enabled;
     _signalSettings = enabled
         ? SignalOptimizationSettings.optimized
         : SignalOptimizationSettings.raw;
     btManager.signalSettings = _signalSettings;
+    if (aecChanged) unawaited(_applyAecCaptureMode());
     notifyListeners();
+  }
+
+  /// El toggle AEC no es un flag que se consulte por paquete: cambia la
+  /// FUENTE de captura de Android (micrófono crudo ↔ camino de comunicación
+  /// con cancelador de eco de hardware), así que requiere reiniciar la
+  /// grabadora para tomar efecto en vivo. Corte de ~0.3 s, imperceptible.
+  Future<void> _applyAecCaptureMode() async {
+    if (!_isActive || !_micEnabled) return;
+    await btManager.setMicEnabled(false);
+    await btManager.setMicEnabled(true);
   }
 
   /// Demo de canal degradado: fuerza AWGN + bit-errores simulados aunque la
@@ -117,6 +129,8 @@ class AppState extends ChangeNotifier {
     bool? aec,
     bool? fec,
   }) {
+    final bool aecChanged =
+        aec != null && aec != _signalSettings.aecEnabled;
     _signalSettings = _signalSettings.copyWith(
       plcEnabled: plc,
       filterEnabled: filter,
@@ -124,6 +138,7 @@ class AppState extends ChangeNotifier {
       fecEnabled: fec,
     );
     btManager.signalSettings = _signalSettings;
+    if (aecChanged) unawaited(_applyAecCaptureMode());
     notifyListeners();
   }
 
@@ -420,7 +435,6 @@ class AppState extends ChangeNotifier {
     _isActive = true;
     notifyListeners();
     _listenToStreams();
-    btManager.isSpeakerActive = () => audioPlayer.isPlaying;
     // La pantalla no debe apagarse durante la sesión: al bloquearse, Android
     // estrangula la app (Doze) y la reproducción acumula segundos de atraso.
     await SystemChannel.keepScreenOn(true);

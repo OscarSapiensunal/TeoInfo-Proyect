@@ -64,17 +64,6 @@ const double kVadRmsThreshold = 0.006;
 /// de verdad (~0.5 s de gracia) — el mismo diseño de los VAD de telefonía.
 const int kVadHangoverFrames = 4;
 
-/// Cola del semi-dúplex (ms): el micrófono se mantiene silenciado un
-/// momento DESPUÉS de que el parlante termina. Cubre dos fuentes de eco
-/// residual: (1) la reverberación de la sala y el desinfle del control
-/// automático de ganancia, y (2) — la más traicionera — el BUFFERING del
-/// pipeline de captura: los chunks del micrófono llegan a Dart 100-300 ms
-/// después de haberse capturado, así que al liberar el gate por hora de
-/// LLEGADA todavía entran chunks capturados MIENTRAS el parlante sonaba
-/// (era el eco que "se escapaba" con el hangover de 300 ms).
-const int kAecGateHangoverMs = 600;
-
-
 /// Número máximo de paquetes perdidos consecutivos antes de limitar el conteo
 /// (protege los contadores ante un SEQ corrupto que parezca un salto gigante).
 const int kMaxConsecutiveLostPackets = 126;
@@ -110,21 +99,18 @@ class BluetoothManager {
   int _txSeq = 0;
   Future<void> _sendChain = Future.value();
 
-  // NOTA (experimento retirado): existió un NLMS adaptativo sobre el audio
-  // del micrófono (dsp/echo_canceller.dart, conservado como anexo). Se
-  // retiró del camino en vivo: el retardo real entre lo reproducido y lo
-  // recapturado es ~300-600 ms (camino acústico + buffering de captura),
-  // pero 128 taps a 8 kHz solo cubren 16 ms — la referencia NUNCA podía
-  // alinearse, así que no cancelaba eco alguno y sus pesos, adaptándose
-  // sobre correlaciones espurias, añadían artefactos audibles a la voz
-  // (confirmado en campo: "al activar el AEC la voz se estropea"). El
-  // semi-dúplex con hangover ES el cancelador de eco efectivo de la app.
-
-  /// Debe devolver true mientras el parlante propio esté reproduciendo algo
-  /// (lo fija AppState apuntando a `audioPlayer.isPlaying`) — es la señal
-  /// que activa el semi-dúplex del cancelador de eco.
-  bool Function()? isSpeakerActive;
-  bool _wasGatingMic = false;
+  // HISTORIA DEL AEC (dos experimentos retirados, ver README dif. 14-16):
+  // 1) NLMS propio en Dart (dsp/echo_canceller.dart, conservado como
+  //    anexo): sin estimación de retardo no podía alinear la referencia
+  //    (~300-600 ms reales vs. 16 ms de cobertura) — no cancelaba y
+  //    añadía artefactos.
+  // 2) Semi-dúplex por software (gate del micrófono mientras el parlante
+  //    sonaba): funcionaba, pero sus transiciones (estimación del fin de
+  //    reproducción + hangover) dejaban escapar ráfagas del arranque de
+  //    cada frase ajena — se percibía como eco JUSTO al activarlo.
+  // La solución definitiva es el AEC DE HARDWARE del teléfono: el toggle
+  // AEC conmuta la FUENTE de captura (micrófono crudo ↔ camino de
+  // comunicación VOICE_COMMUNICATION) — ver AudioCaptureService.
 
   /// Mitigaciones de canal activas en vivo (panel "Optimizar señal" de la
   /// UI). AppState lo reasigna directamente; se lee de nuevo en cada
@@ -155,9 +141,6 @@ class BluetoothManager {
   int _vadSkippedBursts = 0;
   int _vadHangoverRemaining = 0;
 
-  /// Último instante (epoch ms) en que el parlante propio estuvo activo —
-  /// sostiene el gate del semi-dúplex durante [kAecGateHangoverMs] extra.
-  int _speakerActiveLastMs = 0;
 
   /// Estrés reciente del enlace (pérdidas + saturación TX), con decaimiento.
   /// Alimenta la simulación de RSSI: cuando la lectura real por GATT no está
@@ -331,7 +314,8 @@ class BluetoothManager {
       (event) async {
         switch (event.type) {
           case SppServerEventType.waiting:
-            _statusController.add('Esperando a que el otro teléfono se conecte…');
+            _statusController.add(
+                'Esperando conexión entrante… (hazte visible si no apareces)');
             break;
 
           case SppServerEventType.connected:
@@ -477,7 +461,14 @@ class BluetoothManager {
           bitsPerSample: kMicBitsPerSample,
           codec: kCodecMuLaw, // la voz viaja comprimida (G.711 μ-law)
         );
-        final pcmStream = await _capture.startCapture();
+        final pcmStream = await _capture.startCapture(
+          hardwareAec: signalSettings.aecEnabled,
+        );
+        _algorithmLogController.add(signalSettings.aecEnabled
+            ? 'AEC: captura por el camino de comunicación — el cancelador '
+                'de eco de HARDWARE del teléfono está activo'
+            : 'AEC apagado: micrófono crudo — el eco acústico '
+                'parlante→micrófono NO se cancela');
         _pcmSub = pcmStream.listen(
           _onPcmChunk,
           onError: (Object e, StackTrace st) {
@@ -485,7 +476,7 @@ class BluetoothManager {
             _statusController.add('Error de micrófono: $e');
           },
         );
-        _statusController.add('Micrófono al aire — transmisión continua');
+        _statusController.add('Capturando voz (transmisión continua)…');
       } catch (e, st) {
         _log.w('No se pudo iniciar el micrófono: $e', error: e, stackTrace: st);
         _statusController.add('No se pudo activar el micrófono: $e');
@@ -507,43 +498,10 @@ class BluetoothManager {
 
   /// Acumula PCM del micrófono; cada FRAME completo (~128 ms) sale al aire
   /// de inmediato — transmisión continua tipo radio, sin esperar ráfagas.
-  ///
-  /// Cancelación de eco = SEMI-DÚPLEX con hangover: mientras el parlante
-  /// propio reproduce (más [kAecGateHangoverMs] de cola), el audio capturado
-  /// se descarta — así nunca se envía de vuelta lo que el propio parlante
-  /// acaba de emitir. (El NLMS que existió aquí fue retirado: ver la nota
-  /// junto a los campos de estado del AEC.)
+  /// La cancelación de eco ya ocurrió (o no, según el toggle AEC) ANTES de
+  /// llegar aquí: la decide la fuente de captura (ver setMicEnabled y
+  /// AudioCaptureService) — full-dúplex sin gates por software.
   void _onPcmChunk(Uint8List chunk) {
-    if (!signalSettings.aecEnabled) {
-      // AEC apagado: full-dúplex sin gating — el eco acústico propio
-      // (si no hay auriculares) se escucha tal cual, sin ninguna mitigación.
-      _wasGatingMic = false;
-      _frameBuilder.add(chunk);
-      _flushReadyFrames();
-      return;
-    }
-
-    final bool speakerActive = isSpeakerActive?.call() ?? false;
-    final int nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (speakerActive) _speakerActiveLastMs = nowMs;
-    // El gate se sostiene kAecGateHangoverMs después de que el parlante
-    // calla: la reverberación de la sala y el AGC del micrófono siguen
-    // "escupiendo" eco un momento más allá del fin del clip.
-    final bool gated = speakerActive ||
-        (nowMs - _speakerActiveLastMs) < kAecGateHangoverMs;
-    if (gated) {
-      if (!_wasGatingMic) {
-        _algorithmLogController.add(
-            'Anti-eco: micrófono en pausa (el parlante está sonando)');
-      }
-      _wasGatingMic = true;
-      return; // no se acumula ni se envía nada mientras se reproduce
-    }
-    if (_wasGatingMic) {
-      _algorithmLogController.add('Anti-eco: micrófono al aire de nuevo');
-      _wasGatingMic = false;
-    }
-
     _frameBuilder.add(chunk);
     _flushReadyFrames();
   }
@@ -1116,8 +1074,6 @@ class BluetoothManager {
     _vadWasSilent = false;
     _vadSkippedBursts = 0;
     _vadHangoverRemaining = 0;
-    _speakerActiveLastMs = 0;
-    _wasGatingMic = false;
   }
 
   /// Detiene la transmisión/recepción y cierra la conexión.

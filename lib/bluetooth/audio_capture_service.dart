@@ -33,9 +33,20 @@ class AudioCaptureService {
 
   /// Inicia la captura del micrófono y devuelve el stream de bytes PCM
   /// Int16 LE intercalados a [sampleRate] Hz / [numChannels] canales.
+  /// [hardwareAec] decide POR QUÉ CAMINO entra el micrófono — y es el
+  /// verdadero interruptor del eco:
+  ///  · true  → fuente VOICE_COMMUNICATION: Android pasa la captura por el
+  ///    cancelador de eco acústico DE HARDWARE del teléfono (dentro del HAL,
+  ///    con la referencia del parlante alineada muestra a muestra — lo que
+  ///    un AEC en la capa de aplicación no puede ver). Es el mismo mecanismo
+  ///    de WhatsApp/VoIP; incluye supresión de ruido y AGC de voz.
+  ///  · false → fuente MICROPHONE cruda, sin procesamiento: el eco acústico
+  ///    parlante→micrófono pasa tal cual (el "modo sin optimizar" de la
+  ///    demo, donde el problema se puede ESCUCHAR antes de corregirlo).
   Future<Stream<Uint8List>> startCapture({
     int sampleRate = kMicSampleRate,
     int numChannels = kMicNumChannels,
+    bool hardwareAec = true,
   }) async {
     if (!_isOpen) await init();
     if (_isCapturing) await stopCapture();
@@ -47,16 +58,9 @@ class AudioCaptureService {
         toStream: _pcmController!.sink,
         sampleRate: sampleRate,
         numChannels: numChannels,
-        // LA CLAVE DEL ANTI-ECO: capturar por el camino de audio de
-        // COMUNICACIÓN (el de las llamadas), no por el de medios. Con esta
-        // fuente, Android pasa el micrófono por el cancelador de eco
-        // acústico DE HARDWARE del teléfono — que dentro del HAL tiene
-        // acceso alineado a lo que el parlante reproduce y a lo que el
-        // micrófono capta (justo la alineación que nuestro NLMS en Dart no
-        // podía lograr, ver README dif. 14/15). Es el mismo mecanismo que
-        // usan WhatsApp y las apps de VoIP. Trae además supresión de ruido
-        // y control de ganancia orientados a voz.
-        audioSource: AudioSource.voice_communication,
+        audioSource: hardwareAec
+            ? AudioSource.voice_communication
+            : AudioSource.microphone,
       );
     } catch (e) {
       _log.e('Error arrancando la grabadora: $e');
