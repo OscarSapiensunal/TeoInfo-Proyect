@@ -48,3 +48,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Firma de release (Play Store) — NUNCA versionar
+android/key.properties
+*.jks
+*.keystore

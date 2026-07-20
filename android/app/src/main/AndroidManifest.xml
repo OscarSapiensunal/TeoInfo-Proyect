@@ -1,8 +1,7 @@
 <!-- android/app/src/main/AndroidManifest.xml
      Permisos requeridos para Bluetooth Clásico (RFCOMM/SPP) y audio.
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.dsp_bt_analyzer">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- ═══════════════════════════════════════════════════════════════════
          PERMISOS BLUETOOTH
@@ -36,8 +35,6 @@
 
     <!-- Mantener CPU activa durante transmisión/recepción -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <!-- Feature declarations -->
     <uses-feature
@@ -64,12 +61,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- Servicio en primer plano para transmisión BT continua -->
-        <service
-            android:name=".BtTransmissionService"
-            android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
 
         <meta-data
             android:name="flutterEmbedding"
