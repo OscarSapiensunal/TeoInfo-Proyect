@@ -71,7 +71,7 @@ Conceptos del curso directamente aplicados:
 | **Transformada de Fourier / respuesta en frecuencia** (Cap. II 2.5–2.11) | El diseño y análisis del filtro (frecuencia de corte, atenuación) se hace en el dominio de la frecuencia con `scipy.signal.freqz` (DFT computacional, Cap. II 2.11). |
 | **Ruido AWGN** (Cap. IV) | Cuando el RSSI cae bajo −75 dBm, el receptor inyecta ruido blanco gaussiano (método Box-Muller, implementado a mano) proporcional a la degradación, para hacer audible/medible el efecto del canal sobre la señal. |
 | **Medidas del canal físico** | RSSI en dBm (potencia recibida), tasa de pérdida (calidad del canal de datos), latencia por RTT (el emisor mide con su propio reloj, evitando el problema de relojes no sincronizados entre teléfonos). |
-| **Filtro adaptativo — cancelación de eco acústico** (Cap. II, filtro con coeficientes variables en el tiempo) | NLMS (Normalized LMS) de 128 taps que estima, muestra a muestra, el eco acústico parlante→micrófono propio y lo resta antes de transmitir (`echo_canceller.dart`); usa la misma ecuación en diferencias que un FIR, pero con `w[k]` adaptándose con `w[k] += (μ·e[n]/‖x‖²)·x[n−k]`. La mitigación PRINCIPAL y garantizada es semi-dúplex (silenciar el micrófono propio mientras el parlante reproduce); el NLMS ataca el eco residual, no reemplaza al semi-dúplex. |
+| **Cancelación de eco acústico — semi-dúplex; NLMS *explorado y RETIRADO*** (Cap. II) | El AEC efectivo de la app es el **semi-dúplex con hangover**: el micrófono se descarta mientras el parlante propio reproduce (+600 ms de cola, que cubre reverberación y el buffering de captura). Se implementó además un NLMS de 128 taps (`echo_canceller.dart`, conservado como anexo) y se RETIRÓ del camino en vivo tras el análisis: el retardo real referencia→micrófono es ~300-600 ms (camino acústico + buffering), pero 128 taps a 8 kHz cubren solo 16 ms — la referencia jamás podía alinearse, no cancelaba nada, y sus pesos (adaptándose sobre correlaciones espurias) añadían artefactos audibles a la voz. Lección: un filtro adaptativo sin estimación de retardo no es un AEC — por eso los AEC reales (WebRTC) integran alineación temporal y detección de doble-habla. |
 | **Capacidad de canal de Shannon-Hartley** (Cap. IV) | `C = B·log2(1+SNR)` calculada en vivo: `B` = ancho de banda de Nyquist del muestreo, `SNR` estimado como el RSSI actual sobre un piso de ruido asumido de −95 dBm (`information_theory.dart`). Mostrada junto al RSSI para comparar capacidad teórica contra el throughput real observado. |
 | **Entropía de la fuente** (Cap. IV 4.2) | `H(X) = −Σp(x)·log2(p(x))` estimada por histograma de 256 bins sobre cada clip de voz reproducido, contrastada contra la entropía máxima log2(256)=8 bits/muestra (ruido blanco uniforme) — la voz real siempre da menos, por sus silencios y su distribución de amplitud concentrada. |
 | **Corrección de errores hacia adelante — FEC** (Cap. V) | Código de Hamming (7,4) implementado a mano (`error_correction.dart`): 4 bits de datos → 7 bits con 3 de paridad: `p1=d1⊕d2⊕d4, p2=d1⊕d3⊕d4, p3=d2⊕d3⊕d4`. El síndrome de paridad en el receptor apunta directo a la posición del bit volteado y lo corrige sin pedir reenvío. |
@@ -568,7 +568,16 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    liberaba por hora de LLEGADA del chunk del micrófono, pero la captura
    llega a la app 100-300 ms después de capturarse — al abrir el gate aún
    entraban chunks grabados mientras el parlante sonaba (eco residual);
-   el hangover pasó de 300 a 600 ms para cubrir ese buffering.
+   el hangover pasó de 300 a 600 ms para cubrir ese buffering. En la misma
+   prueba se confirmó que el NLMS EMPEORABA la voz al activarlo — análisis
+   en el marco teórico (retardo real ~300-600 ms vs. 16 ms de cobertura del
+   filtro): se retiró del camino en vivo y el semi-dúplex quedó como el
+   AEC efectivo. Dos experimentos retirados con justificación medida (ARQ
+   y NLMS) valen más, metodológicamente, que dos features que empeoran el
+   sistema. La gráfica RSSI/pérdida también mentía: la interpolación
+   bezier de fl_chart "sobrepasa" en saltos bruscos y dibuja bucles hacia
+   atrás en el eje de tiempo — se pasó a líneas rectas (isCurved: false),
+   porque en una gráfica de medición lo que se ve debe ser lo medido.
 
 ---
 

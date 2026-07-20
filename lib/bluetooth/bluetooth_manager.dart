@@ -28,7 +28,6 @@ import 'package:logger/logger.dart';
 import '../models/app_models.dart';
 import '../dsp/companding.dart';
 import '../dsp/dsp_processor.dart';
-import '../dsp/echo_canceller.dart';
 import '../dsp/information_theory.dart';
 import 'audio_capture_service.dart';
 import 'rfcomm_server.dart';
@@ -111,9 +110,15 @@ class BluetoothManager {
   int _txSeq = 0;
   Future<void> _sendChain = Future.value();
 
-  /// Cancelador de eco (ver echo_canceller.dart) aplicado a lo que SÍ se
-  /// captura tras el filtro de semi-dúplex.
-  final EchoCanceller _aec = EchoCanceller();
+  // NOTA (experimento retirado): existió un NLMS adaptativo sobre el audio
+  // del micrófono (dsp/echo_canceller.dart, conservado como anexo). Se
+  // retiró del camino en vivo: el retardo real entre lo reproducido y lo
+  // recapturado es ~300-600 ms (camino acústico + buffering de captura),
+  // pero 128 taps a 8 kHz solo cubren 16 ms — la referencia NUNCA podía
+  // alinearse, así que no cancelaba eco alguno y sus pesos, adaptándose
+  // sobre correlaciones espurias, añadían artefactos audibles a la voz
+  // (confirmado en campo: "al activar el AEC la voz se estropea"). El
+  // semi-dúplex con hangover ES el cancelador de eco efectivo de la app.
 
   /// Debe devolver true mientras el parlante propio esté reproduciendo algo
   /// (lo fija AppState apuntando a `audioPlayer.isPlaying`) — es la señal
@@ -504,18 +509,14 @@ class BluetoothManager {
   /// Acumula PCM del micrófono; cada FRAME completo (~128 ms) sale al aire
   /// de inmediato — transmisión continua tipo radio, sin esperar ráfagas.
   ///
-  /// Cancelación de eco en dos capas:
-  ///  1. Semi-dúplex (garantizado): mientras el parlante PROPIO está
-  ///     reproduciendo algo, se descarta el audio capturado — así nunca se
-  ///     envía de vuelta lo que el propio parlante acaba de emitir. Es la
-  ///     mitigación principal contra el eco fuerte.
-  ///  2. Filtro adaptativo NLMS (ver echo_canceller.dart): sobre lo que SÍ
-  ///     se captura, resta el eco residual estimado usando como referencia
-  ///     lo que se reprodujo recientemente (colas de reverberación,
-  ///     transiciones justo al dejar de estar en semi-dúplex).
+  /// Cancelación de eco = SEMI-DÚPLEX con hangover: mientras el parlante
+  /// propio reproduce (más [kAecGateHangoverMs] de cola), el audio capturado
+  /// se descarta — así nunca se envía de vuelta lo que el propio parlante
+  /// acaba de emitir. (El NLMS que existió aquí fue retirado: ver la nota
+  /// junto a los campos de estado del AEC.)
   void _onPcmChunk(Uint8List chunk) {
     if (!signalSettings.aecEnabled) {
-      // AEC apagado: full-dúplex sin gating ni NLMS — el eco acústico propio
+      // AEC apagado: full-dúplex sin gating — el eco acústico propio
       // (si no hay auriculares) se escucha tal cual, sin ninguna mitigación.
       _wasGatingMic = false;
       _frameBuilder.add(chunk);
@@ -545,8 +546,7 @@ class BluetoothManager {
       _wasGatingMic = false;
     }
 
-    final Uint8List cleaned = _aec.process(chunk);
-    _frameBuilder.add(cleaned);
+    _frameBuilder.add(chunk);
     _flushReadyFrames();
   }
 
@@ -988,7 +988,6 @@ class BluetoothManager {
     if (builder.isEmpty) return;
     final chunk = builder.toBytes();
     _audioChunkController.add(chunk);
-    _aec.pushReference(chunk); // referencia far-end para el cancelador de eco
 
     // Teoría de la Información (Cap. IV) con cadencia acotada: acumula ~1 s
     // de audio y recién entonces calcula/emite — entropía sobre muestras
@@ -1120,7 +1119,6 @@ class BluetoothManager {
     _vadSkippedBursts = 0;
     _vadHangoverRemaining = 0;
     _speakerActiveLastMs = 0;
-    _aec.reset();
     _wasGatingMic = false;
   }
 

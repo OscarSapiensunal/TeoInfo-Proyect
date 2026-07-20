@@ -1192,10 +1192,13 @@ class _RealtimeChartCard extends StatelessWidget {
       maxY: maxY,
       lineBarsData: [
         // ── Línea RSSI ───────────────────────────────────────────────────
+        // isCurved: false — la interpolación bezier de fl_chart "sobrepasa"
+        // horizontalmente en saltos bruscos y dibuja bucles hacia atrás en
+        // el eje del tiempo (reportado como "la gráfica va y se devuelve").
+        // Para datos de medición, líneas rectas: lo que se ve es lo medido.
         LineChartBarData(
           spots: rssiSpots,
-          isCurved: true,
-          curveSmoothness: 0.3,
+          isCurved: false,
           color: _C.rssiLine,
           barWidth: 2,
           isStrokeCapRound: true,
@@ -1208,8 +1211,7 @@ class _RealtimeChartCard extends StatelessWidget {
         // ── Línea Packet Loss (normalizada) ──────────────────────────────
         LineChartBarData(
           spots: lossSpots,
-          isCurved: true,
-          curveSmoothness: 0.3,
+          isCurved: false,
           color: _C.lossLine,
           barWidth: 2,
           isStrokeCapRound: true,
