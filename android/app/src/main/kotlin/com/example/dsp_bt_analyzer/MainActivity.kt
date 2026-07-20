@@ -26,6 +26,7 @@ import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -83,9 +84,53 @@ class MainActivity : FlutterActivity() {
     private var playerSampleRate = 0
     private var playerChannels = 0
 
+    /// Entra al MODO DE COMUNICACIÓN de Android (el de las llamadas): junto
+    /// con la captura VOICE_COMMUNICATION (lado Dart) y la salida
+    /// USAGE_VOICE_COMMUNICATION, engancha el cancelador de eco acústico DE
+    /// HARDWARE del teléfono — el HAL ve reproducción y captura alineadas,
+    /// exactamente lo que un AEC en la capa de aplicación no puede ver.
+    /// Se fuerza el altavoz (speakerphone) para conservar el uso tipo radio.
+    private var previousAudioMode = AudioManager.MODE_NORMAL
+
+    private fun enterCommunicationMode() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            previousAudioMode = am.mode
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val speaker = am.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+                if (speaker != null) am.setCommunicationDevice(speaker)
+            } else {
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = true
+            }
+            Log.i(TAG, "Modo comunicación activo (AEC de hardware + altavoz)")
+        } catch (e: Exception) {
+            Log.w(TAG, "enterCommunicationMode: ${e.message}")
+        }
+    }
+
+    private fun exitCommunicationMode() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                am.clearCommunicationDevice()
+            } else {
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = false
+            }
+            am.mode = previousAudioMode
+        } catch (e: Exception) {
+            Log.w(TAG, "exitCommunicationMode: ${e.message}")
+        }
+    }
+
     private fun startPlayerTrack(sampleRate: Int, channels: Int) {
         if (playerRunning && sampleRate == playerSampleRate && channels == playerChannels) return
         stopPlayerTrack()
+        enterCommunicationMode()
 
         val chMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO
                      else AudioFormat.CHANNEL_OUT_MONO
@@ -93,7 +138,7 @@ class MainActivity : FlutterActivity() {
             sampleRate, chMask, AudioFormat.ENCODING_PCM_16BIT)
         val track = AudioTrack(
             AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build(),
             AudioFormat.Builder()
@@ -138,6 +183,7 @@ class MainActivity : FlutterActivity() {
             playerTrack?.release()
         } catch (_: Exception) {}
         playerTrack = null
+        exitCommunicationMode()
     }
 
     // ── Estado del servidor SPP ───────────────────────────────────────────

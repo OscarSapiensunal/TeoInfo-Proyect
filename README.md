@@ -578,6 +578,23 @@ Documentadas con detalle porque son la parte más formativa del proyecto:
    bezier de fl_chart "sobrepasa" en saltos bruscos y dibuja bucles hacia
    atrás en el eje de tiempo — se pasó a líneas rectas (isCurved: false),
    porque en una gráfica de medición lo que se ve debe ser lo medido.
+15. **¿Cómo cancelan el eco las llamadas de verdad? Por el camino de audio
+   correcto.** Las radios clásicas resuelven el eco POR DISEÑO: son
+   half-duplex (pulsar para hablar) — nuestra capa semi-dúplex es
+   exactamente esa solución. Las llamadas full-dúplex (telefonía, WhatsApp)
+   usan un AEC con filtro adaptativo… pero con una ventaja estructural que
+   una app no puede replicar a mano: corre DENTRO del HAL de audio del
+   teléfono, donde la señal de referencia (lo que sale al parlante) y la
+   captura del micrófono están alineadas muestra a muestra. Android expone
+   ese AEC de hardware a las apps mediante el "camino de comunicación":
+   fuente de captura `VOICE_COMMUNICATION` + salida
+   `USAGE_VOICE_COMMUNICATION` + `MODE_IN_COMMUNICATION` (con altavoz
+   forzado para conservar el uso tipo radio). Nuestra app usaba el camino
+   de MEDIOS (el de la música), donde ese AEC no existe — por eso el eco;
+   y nuestro NLMS propio no podía alinearse (dif. 14). Migrada la captura
+   y la reproducción al camino de comunicación, el mismo cancelador que
+   usan las apps de VoIP trabaja para nosotros, con el semi-dúplex como
+   capa de respaldo conmutable.
 
 ---
 

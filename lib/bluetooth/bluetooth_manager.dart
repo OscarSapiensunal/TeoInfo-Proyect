@@ -331,8 +331,7 @@ class BluetoothManager {
       (event) async {
         switch (event.type) {
           case SppServerEventType.waiting:
-            _statusController.add(
-                'Esperando conexión entrante… (hazte visible si no apareces)');
+            _statusController.add('Esperando a que el otro teléfono se conecte…');
             break;
 
           case SppServerEventType.connected:
@@ -486,7 +485,7 @@ class BluetoothManager {
             _statusController.add('Error de micrófono: $e');
           },
         );
-        _statusController.add('Capturando voz (transmisión continua)…');
+        _statusController.add('Micrófono al aire — transmisión continua');
       } catch (e, st) {
         _log.w('No se pudo iniciar el micrófono: $e', error: e, stackTrace: st);
         _statusController.add('No se pudo activar el micrófono: $e');
@@ -535,14 +534,13 @@ class BluetoothManager {
     if (gated) {
       if (!_wasGatingMic) {
         _algorithmLogController.add(
-            'AEC: micrófono en semi-dúplex (silenciado mientras reproduce '
-            'el parlante propio)');
+            'Anti-eco: micrófono en pausa (el parlante está sonando)');
       }
       _wasGatingMic = true;
       return; // no se acumula ni se envía nada mientras se reproduce
     }
     if (_wasGatingMic) {
-      _algorithmLogController.add('AEC: micrófono reactivado');
+      _algorithmLogController.add('Anti-eco: micrófono al aire de nuevo');
       _wasGatingMic = false;
     }
 

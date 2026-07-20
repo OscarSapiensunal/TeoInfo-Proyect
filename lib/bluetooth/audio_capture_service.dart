@@ -47,6 +47,16 @@ class AudioCaptureService {
         toStream: _pcmController!.sink,
         sampleRate: sampleRate,
         numChannels: numChannels,
+        // LA CLAVE DEL ANTI-ECO: capturar por el camino de audio de
+        // COMUNICACIÓN (el de las llamadas), no por el de medios. Con esta
+        // fuente, Android pasa el micrófono por el cancelador de eco
+        // acústico DE HARDWARE del teléfono — que dentro del HAL tiene
+        // acceso alineado a lo que el parlante reproduce y a lo que el
+        // micrófono capta (justo la alineación que nuestro NLMS en Dart no
+        // podía lograr, ver README dif. 14/15). Es el mismo mecanismo que
+        // usan WhatsApp y las apps de VoIP. Trae además supresión de ruido
+        // y control de ganancia orientados a voz.
+        audioSource: AudioSource.voice_communication,
       );
     } catch (e) {
       _log.e('Error arrancando la grabadora: $e');
