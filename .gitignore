@@ -53,3 +53,6 @@ app.*.map.json
 android/key.properties
 *.jks
 *.keystore
+
+# Archivos temporales de Office
+~$*
